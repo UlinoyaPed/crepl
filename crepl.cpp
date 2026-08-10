@@ -10,6 +10,8 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/LineEditor/LineEditor.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Program.h"
@@ -1867,8 +1869,8 @@ static TypeInfo make_type_info(
 
     const bool is_integer =
         type->isIntegerType() || type->isEnumeralType();
-    const unsigned width = is_integer && size
-        ? static_cast<unsigned>(size->getQuantity() * CHAR_BIT)
+    const unsigned width = is_integer
+        ? context.getIntWidth(type)
         : 0;
 
     return TypeInfo{
@@ -2060,25 +2062,16 @@ static std::string integer_limit(
     unsigned width
 )
 {
-    if (!is_signed) {
-        if (minimum)
-            return "0";
-
-        const std::uint64_t maximum = width == 64
-            ? std::numeric_limits<std::uint64_t>::max()
-            : (std::uint64_t{1} << width) - 1;
-        return std::to_string(maximum);
-    }
-
-    if (width == 64) {
-        return minimum
-            ? std::to_string(std::numeric_limits<std::int64_t>::min())
-            : std::to_string(std::numeric_limits<std::int64_t>::max());
-    }
-
-    const std::int64_t boundary =
-        std::int64_t{1} << (width - 1);
-    return std::to_string(minimum ? -boundary : boundary - 1);
+    const llvm::APInt value = !is_signed
+        ? (minimum
+               ? llvm::APInt::getZero(width)
+               : llvm::APInt::getMaxValue(width))
+        : (minimum
+               ? llvm::APInt::getSignedMinValue(width)
+               : llvm::APInt::getSignedMaxValue(width));
+    llvm::SmallString<128> text;
+    value.toString(text, 10, is_signed, false);
+    return text.str().str();
 }
 
 

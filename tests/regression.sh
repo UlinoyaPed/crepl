@@ -43,6 +43,13 @@ type_values=$(grep -Fc '(int) 1' <<<"$type_output")
 contains "$type_output" 'type     : int' '%type must report the canonical type'
 [[ $type_output != *$'\033'* ]] || fail 'piped input and output must not contain ANSI colors'
 
+wide_type_output=$(run_crepl $'%type (__int128)0\n%type (unsigned __int128)0\n%type (_BitInt(17))0\n%quit\n')
+contains "$wide_type_output" 'min      : -170141183460469231731687303715884105728' 'signed __int128 must have the correct minimum'
+contains "$wide_type_output" 'max      : 170141183460469231731687303715884105727' 'signed __int128 must have the correct maximum'
+contains "$wide_type_output" 'max      : 340282366920938463463374607431768211455' 'unsigned __int128 must have the correct maximum'
+contains "$wide_type_output" 'bits     : 17' '_BitInt must use its semantic integer width'
+contains "$wide_type_output" 'min      : -65536' 'signed _BitInt(17) must have the correct minimum'
+
 if command -v socat >/dev/null 2>&1; then
     pty_output=$(
         printf '%%quit\n' |
