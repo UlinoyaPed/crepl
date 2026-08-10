@@ -355,6 +355,160 @@ static bool print_array(
     return true;
 }
 
+
+static bool is_readable_memory(
+    std::uintptr_t address,
+    std::size_t size
+);
+
+
+static std::uint64_t load_integer_bits(
+    const unsigned char* data,
+    std::size_t size
+)
+{
+    std::uint64_t raw = 0;
+    std::memcpy(&raw, data, size);
+    return raw;
+}
+
+
+static void print_pointer_target(
+    llvm::raw_ostream& out,
+    const clang::ASTContext& context,
+    clang::QualType type,
+    std::uintptr_t address,
+    llvm::StringRef indent,
+    unsigned depth
+)
+{
+    if (depth >= 4 || type->isVoidType() || type->isFunctionType())
+        return;
+
+    const auto size = context.getTypeSizeInCharsIfKnown(type);
+
+    if (!size ||
+        !is_readable_memory(
+            address,
+            static_cast<std::size_t>(size->getQuantity())
+        )) {
+        out << indent << "-> <unreadable>\n";
+        return;
+    }
+
+    const auto* data =
+        reinterpret_cast<const unsigned char*>(address);
+    const std::string type_name =
+        type.getAsString(context.getPrintingPolicy());
+
+    if (const auto* array = context.getAsConstantArrayType(type)) {
+        out << indent << "-> (" << type_name << ") ";
+        print_array_data(out, context, *array, data);
+        out << "\n";
+        return;
+    }
+
+    if (type->isIntegerType() &&
+        size->getQuantity() <= static_cast<std::int64_t>(sizeof(std::uint64_t))) {
+        out << indent << "-> (" << type_name << ") ";
+        print_array_integer(
+            out,
+            type,
+            data,
+            static_cast<std::size_t>(size->getQuantity())
+        );
+        out << "\n";
+
+        if (!type->isBooleanType()) {
+            const unsigned width = static_cast<unsigned>(
+                size->getQuantity() * CHAR_BIT
+            );
+            const std::uint64_t raw = load_integer_bits(
+                data,
+                static_cast<std::size_t>(size->getQuantity())
+            );
+            const std::string bits =
+                std::bitset<64>(raw).to_string().substr(64 - width);
+            std::ostringstream hex;
+            hex << std::hex
+                << std::nouppercase
+                << std::setfill('0')
+                << std::setw(static_cast<int>((width + 3) / 4))
+                << raw;
+
+            out << indent << "   bits : " << group_bits(bits) << "\n"
+                << indent << "   hex  : " << align_hex(hex.str()) << "\n";
+        }
+        return;
+    }
+
+    if (type->isRealFloatingType()) {
+        out << indent << "-> (" << type_name << ") ";
+        print_array_element(out, context, type, data);
+        out << "\n";
+        return;
+    }
+
+    if (type->isPointerType()) {
+        std::uintptr_t next = 0;
+        std::memcpy(&next, data, sizeof(next));
+        out << indent << "-> (" << type_name << ") ";
+
+        if (next == 0) {
+            out << "nullptr\n";
+            return;
+        }
+
+        out << "0x" << llvm::utohexstr(next) << "\n";
+        print_pointer_target(
+            out,
+            context,
+            type->getPointeeType(),
+            next,
+            (indent + "   ").str(),
+            depth + 1
+        );
+        return;
+    }
+
+    out << indent
+        << "-> ("
+        << type_name
+        << ") @0x"
+        << llvm::utohexstr(address)
+        << "\n";
+}
+
+
+static bool print_pointer(
+    llvm::raw_ostream& out,
+    const clang::Value& value
+)
+{
+    clang::QualType type = value.getType();
+
+    if (!type->isPointerType())
+        return false;
+
+    value.print(out);
+
+    const std::uintptr_t address =
+        reinterpret_cast<std::uintptr_t>(value.getPtr());
+
+    if (address != 0) {
+        print_pointer_target(
+            out,
+            value.getASTContext(),
+            type->getPointeeType(),
+            address,
+            "  ",
+            0
+        );
+    }
+
+    return true;
+}
+
 static void print_value(
     llvm::raw_ostream& out,
     const clang::Value& value
@@ -364,6 +518,9 @@ static void print_value(
         return;
 
     if (print_array(out, value))
+        return;
+
+    if (print_pointer(out, value))
         return;
 
     // enum 保留 Clang 自己的输出。
