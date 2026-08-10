@@ -26,6 +26,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -1099,6 +1100,18 @@ struct TypeInfo {
 };
 
 
+struct SnapshotValue {
+    std::string fingerprint;
+    std::string rendered;
+    std::optional<IntegerView> integer;
+};
+
+
+struct Snapshot {
+    std::map<std::string, SnapshotValue> values;
+};
+
+
 static bool is_identifier(
     llvm::StringRef name
 )
@@ -1946,6 +1959,139 @@ static bool refresh_watches(
 }
 
 
+static bool is_integer_kind(
+    clang::Value::Kind kind
+)
+{
+    return kind >= clang::Value::K_Bool &&
+        kind <= clang::Value::K_ULongLong;
+}
+
+
+static llvm::Expected<Snapshot> capture_snapshot(
+    clang::Interpreter& interpreter,
+    const std::vector<Watch>& watches
+)
+{
+    Snapshot snapshot;
+
+    for (const Watch& watch : watches) {
+        auto captured = capture_expression(interpreter, watch.name);
+
+        if (!captured)
+            return captured.takeError();
+
+        std::optional<IntegerView> integer;
+
+        if (is_integer_kind(captured->kind)) {
+            auto integer_result =
+                capture_integer(interpreter, watch.name);
+
+            if (integer_result)
+                integer = std::move(*integer_result);
+            else
+                llvm::consumeError(integer_result.takeError());
+        }
+
+        snapshot.values.emplace(
+            watch.name,
+            SnapshotValue{
+                captured->fingerprint,
+                captured->rendered,
+                std::move(integer)
+            }
+        );
+    }
+
+    return snapshot;
+}
+
+
+static void print_state(
+    const Snapshot& snapshot
+)
+{
+    if (snapshot.values.empty()) {
+        llvm::outs() << "no watched state\n";
+        return;
+    }
+
+    for (const auto& entry : snapshot.values) {
+        llvm::outs()
+            << entry.first
+            << ":\n"
+            << entry.second.rendered;
+    }
+}
+
+
+static void print_snapshot_diff(
+    const Snapshot& before,
+    const Snapshot& after
+)
+{
+    std::set<std::string> names;
+
+    for (const auto& entry : before.values)
+        names.insert(entry.first);
+    for (const auto& entry : after.values)
+        names.insert(entry.first);
+
+    bool changed = false;
+
+    for (const std::string& name : names) {
+        const auto old_value = before.values.find(name);
+        const auto new_value = after.values.find(name);
+
+        if (old_value != before.values.end() &&
+            new_value != after.values.end() &&
+            old_value->second.fingerprint ==
+                new_value->second.fingerprint) {
+            continue;
+        }
+
+        changed = true;
+        llvm::outs() << name << ":\n";
+
+        if (old_value == before.values.end()) {
+            llvm::outs()
+                << "before: <not watched>\n"
+                << "after:\n"
+                << new_value->second.rendered;
+            continue;
+        }
+
+        if (new_value == after.values.end()) {
+            llvm::outs()
+                << "before:\n"
+                << old_value->second.rendered
+                << "after: <not watched>\n";
+            continue;
+        }
+
+        llvm::outs()
+            << "before:\n"
+            << old_value->second.rendered
+            << "after:\n"
+            << new_value->second.rendered;
+
+        if (old_value->second.integer &&
+            new_value->second.integer &&
+            old_value->second.integer->width ==
+                new_value->second.integer->width) {
+            llvm::outs() << "changed bits:\n";
+            print_integer_diff(
+                *old_value->second.integer,
+                *new_value->second.integer
+            );
+        }
+    }
+
+    if (!changed)
+        llvm::outs() << "no changes\n";
+}
+
+
 // ============================================================
 // LLVM error 输出
 // ============================================================
@@ -2093,6 +2239,8 @@ int main()
     std::string input;
     bool join_next_line = false;
     std::vector<Watch> watches;
+    std::vector<std::string> history;
+    std::map<std::string, Snapshot> snapshots;
 
 
     while (
@@ -2164,6 +2312,9 @@ int main()
                 << "%sizeof <arg> show sizeof(type-or-expression)\n"
                 << "%alignof <type> show a type's alignment\n"
                 << "%layout <type> show record fields and padding\n"
+                << "%state         show all watched values\n"
+                << "%snapshot <name> save watched state\n"
+                << "%history [count] show successful C++ inputs\n"
                 << "%undo          undo previous input\n"
                 << "%lib <path>    load dynamic library\n"
                 << "%quit          exit\n";
@@ -2171,6 +2322,94 @@ int main()
             input.clear();
             editor.setPrompt("crepl> ");
 
+            continue;
+        }
+
+
+        if (input == "%state") {
+            auto state = capture_snapshot(*interpreter, watches);
+
+            if (!state)
+                print_error(state.takeError());
+            else
+                print_state(*state);
+
+            input.clear();
+            editor.setPrompt("crepl> ");
+            continue;
+        }
+
+
+        if (
+            input == "%snapshot" ||
+            llvm::StringRef(input).starts_with("%snapshot ")
+        ) {
+            const llvm::StringRef name = input == "%snapshot"
+                ? llvm::StringRef()
+                : llvm::StringRef(input).drop_front(10).trim();
+
+            if (name.empty() || !is_identifier(name)) {
+                llvm::errs() << "error: usage: %snapshot <name>\n";
+            }
+            else if (watches.empty()) {
+                llvm::errs()
+                    << "error: add variables with %watch before taking a "
+                    << "snapshot\n";
+            }
+            else {
+                auto snapshot =
+                    capture_snapshot(*interpreter, watches);
+
+                if (!snapshot) {
+                    print_error(snapshot.takeError());
+                }
+                else {
+                    snapshots[name.str()] = std::move(*snapshot);
+                    llvm::outs() << "saved snapshot " << name << "\n";
+                }
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
+            continue;
+        }
+
+
+        if (
+            input == "%history" ||
+            llvm::StringRef(input).starts_with("%history ")
+        ) {
+            const llvm::StringRef count_text = input == "%history"
+                ? llvm::StringRef()
+                : llvm::StringRef(input).drop_front(9).trim();
+            std::uint64_t requested = history.size();
+            bool valid = true;
+
+            if (!count_text.empty() &&
+                (count_text.getAsInteger(10, requested) || requested == 0)) {
+                valid = false;
+                llvm::errs()
+                    << "error: usage: %history [positive-count]\n";
+            }
+
+            if (valid) {
+                const std::size_t count = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(requested, history.size())
+                );
+                const std::size_t begin = history.size() - count;
+
+                for (std::size_t index = begin; index < history.size();
+                     ++index) {
+                    llvm::outs()
+                        << index + 1
+                        << "  "
+                        << history[index]
+                        << "\n";
+                }
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
             continue;
         }
 
@@ -2361,6 +2600,13 @@ int main()
             if (old_expression.empty() || new_expression.empty()) {
                 llvm::errs()
                     << "error: usage: %diff <old> <new-expression>\n";
+            }
+            else if (snapshots.count(old_expression.str()) != 0 &&
+                     snapshots.count(new_expression.str()) != 0) {
+                print_snapshot_diff(
+                    snapshots.at(old_expression.str()),
+                    snapshots.at(new_expression.str())
+                );
             }
             else {
                 auto old_value =
@@ -2586,6 +2832,8 @@ int main()
             }
             else {
                 refresh_watches(*interpreter, watches);
+                if (!history.empty())
+                    history.pop_back();
             }
 
             input.clear();
@@ -2663,6 +2911,7 @@ int main()
         }
 
         if (execution_succeeded) {
+            history.push_back(input);
             const bool watched_changed =
                 refresh_watches(*interpreter, watches);
 
