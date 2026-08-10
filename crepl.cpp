@@ -1578,6 +1578,140 @@ static void print_type_info(
 }
 
 
+static const clang::RecordDecl* find_record(
+    clang::ASTContext& context,
+    llvm::StringRef name
+)
+{
+    if (!is_identifier(name))
+        return nullptr;
+
+    const clang::DeclarationName declaration_name(
+        &context.Idents.get(name)
+    );
+    const auto declarations =
+        context.getTranslationUnitDecl()->lookup(declaration_name);
+
+    for (const clang::NamedDecl* declaration : declarations) {
+        if (const auto* record =
+                llvm::dyn_cast<clang::RecordDecl>(declaration)) {
+            if (const clang::RecordDecl* definition =
+                    record->getDefinition()) {
+                return definition;
+            }
+        }
+
+        if (const auto* type_name =
+                llvm::dyn_cast<clang::TypedefNameDecl>(declaration)) {
+            if (const auto* record =
+                    type_name->getUnderlyingType()->getAsRecordDecl()) {
+                if (const clang::RecordDecl* definition =
+                        record->getDefinition()) {
+                    return definition;
+                }
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+
+static std::string byte_count(
+    std::uint64_t bytes
+)
+{
+    return std::to_string(bytes) + (bytes == 1 ? " byte" : " bytes");
+}
+
+
+static void print_layout(
+    clang::ASTContext& context,
+    const clang::RecordDecl& record
+)
+{
+    const clang::ASTRecordLayout& layout =
+        context.getASTRecordLayout(&record);
+    const std::uint64_t size = static_cast<std::uint64_t>(
+        layout.getSize().getQuantity()
+    );
+    const std::uint64_t alignment = static_cast<std::uint64_t>(
+        layout.getAlignment().getQuantity()
+    );
+    const char* tag = record.isUnion()
+        ? "union"
+        : record.isClass() ? "class" : "struct";
+
+    llvm::outs()
+        << tag << " " << record.getName()
+        << "    size=" << size
+        << " align=" << alignment
+        << "\n\n"
+        << "offset  member\n";
+
+    std::uint64_t cursor_bits = 0;
+
+    for (const clang::FieldDecl* field : record.fields()) {
+        const std::uint64_t offset_bits =
+            context.getFieldOffset(field);
+        const std::uint64_t field_bits = field->isBitField()
+            ? field->getBitWidthValue()
+            : context.getTypeSize(field->getType());
+
+        if (!record.isUnion() &&
+            offset_bits > cursor_bits &&
+            cursor_bits % CHAR_BIT == 0 &&
+            offset_bits % CHAR_BIT == 0) {
+            const std::uint64_t padding =
+                (offset_bits - cursor_bits) / CHAR_BIT;
+            llvm::outs()
+                << cursor_bits / CHAR_BIT
+                << std::string(
+                       cursor_bits / CHAR_BIT < 10 ? 7 : 6,
+                       ' '
+                   )
+                << "padding    "
+                << byte_count(padding)
+                << "\n";
+        }
+
+        llvm::outs()
+            << offset_bits / CHAR_BIT;
+
+        if (field->isBitField())
+            llvm::outs() << "." << offset_bits % CHAR_BIT;
+
+        llvm::outs()
+            << std::string(offset_bits / CHAR_BIT < 10 ? 7 : 6, ' ')
+            << field->getType().getAsString(context.getPrintingPolicy())
+            << " "
+            << (field->getName().empty() ? "<unnamed>" : field->getName())
+            << "    ";
+
+        if (field->isBitField())
+            llvm::outs() << field_bits << " bits\n";
+        else
+            llvm::outs() << byte_count(field_bits / CHAR_BIT) << "\n";
+
+        if (!record.isUnion())
+            cursor_bits = std::max(cursor_bits, offset_bits + field_bits);
+    }
+
+    const std::uint64_t total_bits = size * CHAR_BIT;
+
+    if (!record.isUnion() &&
+        total_bits > cursor_bits &&
+        cursor_bits % CHAR_BIT == 0) {
+        llvm::outs()
+            << cursor_bits / CHAR_BIT
+            << std::string(cursor_bits / CHAR_BIT < 10 ? 7 : 6, ' ')
+            << "padding    "
+            << byte_count((total_bits - cursor_bits) / CHAR_BIT)
+            << "\n";
+    }
+}
+
+
 static bool is_readable_memory(
     std::uintptr_t address,
     std::size_t size
@@ -1912,6 +2046,9 @@ int main()
                 << "%diff <old> <new-expr> compare integer bit patterns\n"
                 << "%type <expr>  show type and integer limits\n"
                 << "%index <expr> show sequence indexes and values\n"
+                << "%sizeof <arg> show sizeof(type-or-expression)\n"
+                << "%alignof <type> show a type's alignment\n"
+                << "%layout <type> show record fields and padding\n"
                 << "%undo          undo previous input\n"
                 << "%lib <path>    load dynamic library\n"
                 << "%quit          exit\n";
@@ -1994,6 +2131,99 @@ int main()
                              expression
                          )) {
                 print_error(std::move(error));
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
+            continue;
+        }
+
+
+        if (
+            input == "%sizeof" ||
+            llvm::StringRef(input).starts_with("%sizeof ")
+        ) {
+            const llvm::StringRef argument = input == "%sizeof"
+                ? llvm::StringRef()
+                : llvm::StringRef(input).drop_front(8).trim();
+
+            if (argument.empty()) {
+                llvm::errs()
+                    << "error: usage: %sizeof <type-or-expression>\n";
+            }
+            else {
+                auto size = capture_integer(
+                    *interpreter,
+                    "sizeof(" + argument.str() + ")"
+                );
+
+                if (!size)
+                    print_error(size.takeError());
+                else
+                    llvm::outs() << "size : " << size->raw << " bytes\n";
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
+            continue;
+        }
+
+
+        if (
+            input == "%alignof" ||
+            llvm::StringRef(input).starts_with("%alignof ")
+        ) {
+            const llvm::StringRef argument = input == "%alignof"
+                ? llvm::StringRef()
+                : llvm::StringRef(input).drop_front(9).trim();
+
+            if (argument.empty()) {
+                llvm::errs() << "error: usage: %alignof <type>\n";
+            }
+            else {
+                auto alignment = capture_integer(
+                    *interpreter,
+                    "alignof(" + argument.str() + ")"
+                );
+
+                if (!alignment)
+                    print_error(alignment.takeError());
+                else
+                    llvm::outs()
+                        << "alignment : "
+                        << alignment->raw
+                        << " bytes\n";
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
+            continue;
+        }
+
+
+        if (
+            input == "%layout" ||
+            llvm::StringRef(input).starts_with("%layout ")
+        ) {
+            const llvm::StringRef name = input == "%layout"
+                ? llvm::StringRef()
+                : llvm::StringRef(input).drop_front(8).trim();
+
+            if (name.empty() || !is_identifier(name)) {
+                llvm::errs() << "error: usage: %layout <record-name>\n";
+            }
+            else if (const clang::RecordDecl* record =
+                         find_record(
+                             interpreter->getASTContext(),
+                             name
+                         )) {
+                print_layout(interpreter->getASTContext(), *record);
+            }
+            else {
+                llvm::errs()
+                    << "error: complete record type not found: "
+                    << name
+                    << "\n";
             }
 
             input.clear();
