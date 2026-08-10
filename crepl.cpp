@@ -2821,8 +2821,10 @@ int main()
 
 
         if (input == "%undo") {
-
-            if (
+            if (history.empty()) {
+                llvm::errs() << "error: no user input to undo\n";
+            }
+            else if (
                 auto error =
                     interpreter->Undo()
             ) {
