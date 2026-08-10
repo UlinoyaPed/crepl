@@ -1951,6 +1951,18 @@ static void print_layout(
     const clang::RecordDecl& record
 )
 {
+    if (const auto* cxx_record =
+            llvm::dyn_cast<clang::CXXRecordDecl>(&record)) {
+        if (cxx_record->getNumBases() != 0 ||
+            cxx_record->isDynamicClass()) {
+            llvm::errs()
+                << "error: inheritance/vptr layout is not supported yet; "
+                << "%layout refuses to label base subobjects or vptr "
+                << "storage as padding\n";
+            return;
+        }
+    }
+
     const clang::ASTRecordLayout& layout =
         context.getASTRecordLayout(&record);
     const std::uint64_t size = static_cast<std::uint64_t>(
