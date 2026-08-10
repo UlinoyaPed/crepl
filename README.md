@@ -40,6 +40,12 @@ clang++ \
 ./crepl
 ```
 
+运行黑盒回归测试（脚本会先使用上面的命令重新编译）：
+
+```bash
+tests/regression.sh
+```
+
 解释器内使用 C++20（`crepl.cpp` 传给 `IncrementalCompilerBuilder` 的选项），
 而宿主程序本身以 C++17 编译。
 
@@ -156,8 +162,15 @@ value : 4 5 6
 
 `%index` 同样支持原生 C 数组。`std::vector` 的读取使用本机 Clang AST 定位
 libstdc++ 的 `_M_start` / `_M_finish` 字段，因此这是明确的 libstdc++ ABI
-耦合点。位压缩特化 `std::vector<bool>` 保留默认输出；嵌套标准容器元素
-暂时显示为 `<value>`，原生多维 C 数组不受此限制。
+耦合点。当前只接受 `std::vector<T, std::allocator<T>>`，并验证两个字段确实
+是大小匹配、指向 `T` 的原生指针；自定义 allocator、fancy pointer、
+`std::vector<bool>` 或检查不通过的实现会回退到 Clang 默认对象输出。
+嵌套标准容器元素暂时显示为 `<value>`，原生多维 C 数组不受此限制。
+
+所有序列视图（普通输出、`%index` 和 watch 指纹）最多处理前 256 项，超出时
+显示 `... <N more>`。因此 watch 能检测序列长度和前 256 项的变化，但不会因
+第 257 项以后的单独变化而触发输出；这是为了让每条 REPL 输入的自动监视
+成本保持有界。
 
 ## Bit 与类型检查
 
@@ -194,6 +207,10 @@ min      : 0
 max      : 18446744073709551615
 ```
 
+类型查询通过内部 `decltype((expr))` 在 unevaluated context 中完成，不会执行
+表达式；例如 `%type ++x` 不会修改 `x`。查询产生的临时 type alias 会立即用
+`Interpreter::Undo()` 清除，也不会占用用户可见的撤销历史。
+
 ## 指针输出
 
 非 null 指针会在原地址输出之后安全地展示目标值。整数目标继续显示完整
@@ -208,8 +225,9 @@ crepl> p
      hex  :    0    0    0    0    0    0    0    d
 ```
 
-解引用前同样检查 `/proc/self/maps`。对象指针只显示目标类型和地址，不会猜测
-业务对象内部关系；链表等 record 级可视化仍属于后续扩展。
+解引用前先检查 `/proc/self/maps`，再通过 `process_vm_readv()` 把目标字节复制
+到本地 buffer，渲染层不会直接访问目标地址。对象指针只显示目标类型和地址，
+不会猜测业务对象内部关系；链表等 record 级可视化仍属于后续扩展。
 
 ## 监视变量
 
@@ -321,8 +339,11 @@ crepl> %mem p 32
 1–65536 字节。
 
 读取前程序会检查 Linux `/proc/self/maps`，拒绝 null、地址溢出、未映射或
-不可读的范围。这能阻止常见的错误地址导致进程崩溃，但内存查看仍应只用于
-当前进程中生命周期有效的对象和指针。
+不可读的范围，然后用 `process_vm_readv()` 一次复制到本地 buffer 后再渲染。
+这会降低常见非法地址、映射竞争和渲染期间地址变化导致崩溃的概率，但仍是
+best-effort 保护，不是 debugger 的一致性快照：其他线程仍可能并发修改内容，
+读取也可能因为映射或后备文件状态变化而失败。内存查看应只用于当前进程中
+生命周期有效的对象和指针。
 
 ## 大小、对齐与 record 布局
 
@@ -347,8 +368,9 @@ crepl> %alignof A
 alignment : 4 bytes
 ```
 
-union 和 bit-field 也可检查。当前 `%layout` 以直接字段布局为重点，不展开
-C++ 对象的继承树或虚表。
+union 和 bit-field 也可检查。为避免把基类子对象或 vptr 错报成 padding，
+当前 `%layout` 遇到有基类或 dynamic class 的 C++ record 会明确拒绝诊断；
+尚未实现继承树、virtual base 和虚表布局展示。
 
 ## REPL 命令
 
@@ -388,14 +410,16 @@ C++ 对象的继承树或虚表。
 - `ASTContext` 的 record layout、field/base offset 和 template specialization
   接口。
 
-变量监视和内存查看还依赖 `Interpreter::Undo()` 清理内部求值产生的增量
-编译单元。内存范围检查通过 `/proc/self/maps` 实现，因此 `%mem` 当前明确
-面向 Linux。
+变量监视、快照和辅助捕获依赖 `Interpreter::Undo()` 清理内部求值产生的增量
+编译单元；`%type` 则用同一机制清理 unevaluated type alias。内存范围检查
+使用 `/proc/self/maps`，安全复制使用 Linux `process_vm_readv()`，因此 `%mem`
+当前明确面向 Linux。
 
 `std::vector` pretty printer 通过 Clang AST 查找当前 libstdc++ 实例化中的
-`_M_start` 和 `_M_finish`，不硬编码字节 offset，但仍依赖这些字段名和三指针
-布局语义。换用 libc++ 或升级到改变内部结构的 libstdc++ 时会自动回退为
-Clang 默认对象输出，应重新验证这一部分。
+`_M_start` 和 `_M_finish`，不硬编码字节 offset，但仍依赖这些字段名和布局
+语义。它只为 `std::allocator<T>` 启用，并检查字段是同类型的原生 `T*`；
+检查不通过时回退为 Clang 默认对象输出。字段名称保持不变但语义发生变化的
+未来 ABI 仍无法仅靠 AST 完全证明安全，因此升级 libstdc++ 后应重新验证。
 
 自动多行输入由宿主侧 lexer 状态和 `()[]{}` 平衡判断完成，不调用 Clang 的
 私有 parser recovery 状态。这覆盖函数、控制块、初始化列表和跨行表达式，
