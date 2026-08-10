@@ -1727,66 +1727,87 @@ static llvm::Expected<IntegerView> capture_integer(
 }
 
 
+static TypeInfo make_type_info(
+    const clang::ASTContext& context,
+    clang::QualType type
+)
+{
+    if (type->isReferenceType())
+        type = type->getPointeeType();
+    type = type.getCanonicalType();
+
+    const auto size = context.getTypeSizeInCharsIfKnown(type);
+    std::optional<std::size_t> size_bytes;
+    std::optional<std::size_t> alignment_bytes;
+
+    if (size) {
+        size_bytes = static_cast<std::size_t>(size->getQuantity());
+        alignment_bytes = static_cast<std::size_t>(
+            context.getTypeAlignInChars(type).getQuantity()
+        );
+    }
+
+    const bool is_integer =
+        type->isIntegerType() || type->isEnumeralType();
+    const unsigned width = is_integer && size
+        ? static_cast<unsigned>(size->getQuantity() * CHAR_BIT)
+        : 0;
+
+    return TypeInfo{
+        type.getAsString(context.getPrintingPolicy()),
+        size_bytes,
+        alignment_bytes,
+        is_integer,
+        type->isBooleanType(),
+        type->isSignedIntegerOrEnumerationType(),
+        width
+    };
+}
+
+
 static llvm::Expected<TypeInfo> capture_type_info(
     clang::Interpreter& interpreter,
     llvm::StringRef expression
 )
 {
+    static std::uint64_t alias_counter = 0;
+    const std::string alias =
+        "__crepl_type_" + std::to_string(++alias_counter);
+    const std::string query =
+        "#pragma clang diagnostic push\n"
+        "#pragma clang diagnostic ignored \"-Wunevaluated-expression\"\n"
+        "using " + alias + " = decltype((" + expression.str() + "));\n"
+        "#pragma clang diagnostic pop";
     std::optional<TypeInfo> result;
-    std::optional<std::string> validation_error;
 
-    {
-        clang::Value value;
+    if (auto error = interpreter.ParseAndExecute(query))
+        return std::move(error);
 
-        if (auto error = interpreter.ParseAndExecute(expression, &value))
-            return std::move(error);
+    clang::ASTContext& context = interpreter.getASTContext();
+    const clang::DeclarationName declaration_name(
+        &context.Idents.get(alias)
+    );
+    const auto declarations =
+        context.getTranslationUnitDecl()->lookup(declaration_name);
 
-        if (!value.isValid()) {
-            validation_error = "expression has no type";
-        }
-        else {
-            const clang::ASTContext& context = value.getASTContext();
-            clang::QualType type = value.getType();
-
-            if (type->isReferenceType())
-                type = type->getPointeeType();
-
-            const auto size = context.getTypeSizeInCharsIfKnown(type);
-            std::optional<std::size_t> size_bytes;
-            std::optional<std::size_t> alignment_bytes;
-
-            if (size) {
-                size_bytes = static_cast<std::size_t>(size->getQuantity());
-                alignment_bytes = static_cast<std::size_t>(
-                    context.getTypeAlignInChars(type).getQuantity()
-                );
-            }
-
-            const bool is_integer =
-                type->isIntegerType() || type->isEnumeralType();
-            const unsigned width = is_integer && size
-                ? static_cast<unsigned>(size->getQuantity() * CHAR_BIT)
-                : 0;
-
-            result = TypeInfo{
-                type.getAsString(context.getPrintingPolicy()),
-                size_bytes,
-                alignment_bytes,
-                is_integer,
-                type->isBooleanType(),
-                type->isSignedIntegerOrEnumerationType(),
-                width
-            };
+    for (const clang::NamedDecl* declaration : declarations) {
+        if (const auto* type_alias =
+                llvm::dyn_cast<clang::TypedefNameDecl>(declaration)) {
+            result = make_type_info(
+                context,
+                type_alias->getUnderlyingType()
+            );
+            break;
         }
     }
 
     if (auto error = interpreter.Undo())
         return std::move(error);
 
-    if (validation_error) {
+    if (!result) {
         return llvm::createStringError(
             std::make_error_code(std::errc::invalid_argument),
-            *validation_error
+            "could not recover the unevaluated expression type"
         );
     }
 
