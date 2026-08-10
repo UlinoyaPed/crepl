@@ -329,6 +329,8 @@ static void print_integer(
 // bool / float / double / pointer / object：Clang 原来的 printer
 // ============================================================
 
+static constexpr std::size_t sequence_display_limit = 256;
+
 static void print_array_element(
     llvm::raw_ostream& out,
     const clang::ASTContext& context,
@@ -351,10 +353,14 @@ static void print_array_data(
     const std::size_t stride = static_cast<std::size_t>(
         context.getTypeSizeInChars(element_type).getQuantity()
     );
+    const std::uint64_t displayed = std::min<std::uint64_t>(
+        count,
+        sequence_display_limit
+    );
 
     out << "[";
 
-    for (std::uint64_t index = 0; index < count; ++index) {
+    for (std::uint64_t index = 0; index < displayed; ++index) {
         if (index != 0)
             out << ", ";
 
@@ -364,6 +370,12 @@ static void print_array_data(
             element_type,
             data + index * stride
         );
+    }
+
+    if (displayed < count) {
+        if (displayed != 0)
+            out << ", ";
+        out << "... <" << count - displayed << " more>";
     }
 
     out << "]";
@@ -790,9 +802,6 @@ static std::optional<SequenceInfo> get_sequence_info(
 
         const std::size_t count = (finish - start) / stride;
 
-        if (count > 100000)
-            return std::nullopt;
-
         return SequenceInfo{&context, element_type, start, count};
     }
 
@@ -837,17 +846,21 @@ static bool print_sequence(
         sequence->context->getTypeSizeInChars(sequence->element_type)
             .getQuantity()
     );
+    const std::size_t displayed = std::min(
+        sequence->count,
+        sequence_display_limit
+    );
 
     if (stride != 0 &&
-        sequence->count >
+        displayed >
             std::numeric_limits<std::size_t>::max() / stride) {
         return false;
     }
 
-    if (sequence->count != 0 &&
+    if (displayed != 0 &&
         !is_readable_memory(
             sequence->data,
-            sequence->count * stride
+            displayed * stride
         )) {
         return false;
     }
@@ -858,10 +871,16 @@ static bool print_sequence(
     reset_color(out);
     out << ") [";
 
-    for (std::size_t index = 0; index < sequence->count; ++index) {
+    for (std::size_t index = 0; index < displayed; ++index) {
         if (index != 0)
             out << ", ";
         out << sequence_element_string(*sequence, index);
+    }
+
+    if (displayed < sequence->count) {
+        if (displayed != 0)
+            out << ", ";
+        out << "... <" << sequence->count - displayed << " more>";
     }
 
     out << "]\n";
@@ -883,14 +902,18 @@ static bool print_sequence_index(
         sequence->context->getTypeSizeInChars(sequence->element_type)
             .getQuantity()
     );
+    const std::size_t displayed = std::min(
+        sequence->count,
+        sequence_display_limit
+    );
 
     if (stride == 0 ||
-        sequence->count >
+        displayed >
             std::numeric_limits<std::size_t>::max() / stride ||
-        (sequence->count != 0 &&
+        (displayed != 0 &&
          !is_readable_memory(
              sequence->data,
-             sequence->count * stride
+             displayed * stride
          ))) {
         return false;
     }
@@ -899,7 +922,7 @@ static bool print_sequence_index(
     std::vector<std::string> values;
     std::vector<std::size_t> widths;
 
-    for (std::size_t index = 0; index < sequence->count; ++index) {
+    for (std::size_t index = 0; index < displayed; ++index) {
         indexes.push_back(std::to_string(index));
         values.push_back(sequence_element_string(*sequence, index));
         widths.push_back(std::max(
@@ -909,13 +932,19 @@ static bool print_sequence_index(
     }
 
     print_label(out, "index :");
-    for (std::size_t index = 0; index < sequence->count; ++index)
+    for (std::size_t index = 0; index < displayed; ++index)
         out << " " << centered(indexes[index], widths[index]);
+
+    if (displayed < sequence->count)
+        out << " ...";
 
     out << "\n";
     print_label(out, "value :");
-    for (std::size_t index = 0; index < sequence->count; ++index)
+    for (std::size_t index = 0; index < displayed; ++index)
         out << " " << centered(values[index], widths[index]);
+
+    if (displayed < sequence->count)
+        out << " <" << sequence->count - displayed << " more>";
 
     out << "\n";
     return true;
