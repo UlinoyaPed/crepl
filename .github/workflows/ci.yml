@@ -25,28 +25,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM, Clang, CMake, and Ninja
+      - name: Install LLVM 22, Clang, CMake, and Ninja
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            clang \
             cmake \
-            libclang-cpp-dev \
-            libclang-dev \
             libedit-dev \
-            llvm-dev \
             ninja-build \
-            socat
+            socat \
+            wget
+          wget --quiet --output-document=/tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 22
+          sudo apt-get install --yes \
+            libclang-22-dev \
+            libclang-cpp22-dev \
+            llvm-22-dev
 
       - name: Configure
         shell: bash
         run: |
-          llvm_cmake_dir=$(llvm-config --cmakedir)
+          llvm_cmake_dir=$(llvm-config-22 --cmakedir)
           clang_cmake_dir=${llvm_cmake_dir%/llvm}/clang
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER=clang-22 \
+            -DCMAKE_CXX_COMPILER=clang++-22 \
             -DLLVM_DIR="$llvm_cmake_dir" \
             -DClang_DIR="$clang_cmake_dir" \
             -DBUILD_TESTING=ON

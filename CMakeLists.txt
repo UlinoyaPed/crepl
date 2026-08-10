@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(crepl VERSION 0.1.0 LANGUAGES C CXX)
 
-find_package(LLVM REQUIRED CONFIG)
-find_package(Clang REQUIRED CONFIG)
+find_package(LLVM 22 REQUIRED CONFIG)
+find_package(Clang 22 REQUIRED CONFIG)
 
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake from ${LLVM_DIR}")
@@ -22,6 +22,9 @@ target_include_directories(crepl SYSTEM PRIVATE
     ${CLANG_INCLUDE_DIRS}
 )
 target_compile_definitions(crepl PRIVATE ${LLVM_DEFINITIONS_LIST})
+target_compile_definitions(crepl PRIVATE
+    CREPL_CLANG_BINARY="${LLVM_TOOLS_BINARY_DIR}/clang++${CMAKE_EXECUTABLE_SUFFIX}"
+)
 
 if(TARGET clang-cpp)
     target_link_libraries(crepl PRIVATE clang-cpp)

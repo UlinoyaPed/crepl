@@ -8,7 +8,7 @@ Clang REPL 对普通声明、表达式和对象的执行能力，并为裸整数
 ## 依赖
 
 当前实现已在 Fedora Linux、Clang/LLVM 22.1.8、GCC/libstdc++ 16 上验证。
-构建需要 CMake 3.20+、Ninja、支持 C++20 的 Clang，以及包含
+构建需要 CMake 3.20+、Ninja、Clang/LLVM 22，以及包含
 `LLVMConfig.cmake`、`ClangConfig.cmake`、Clang Interpreter 头文件和库的
 LLVM/Clang 开发包。Fedora 可安装：
 
@@ -16,9 +16,9 @@ LLVM/Clang 开发包。Fedora 可安装：
 sudo dnf install clang-devel llvm-devel gcc-c++ cmake ninja-build
 ```
 
-运行时需要能在 `PATH` 中找到与链接的 `libclang-cpp` 相匹配的 `clang++`。
-程序会从该可执行文件推导 Clang 的 resource directory，以便解释器能找到
-`stddef.h` 等 Clang builtin headers。
+CMake 会把所链接 LLVM 安装中的 `clang++` 路径编入程序。程序从该可执行文件
+推导 Clang 的 resource directory，以便解释器能找到 `stddef.h` 等 builtin
+headers，并避免系统中存在多个 LLVM 版本时误用不匹配的驱动。
 
 ## 编译
 
@@ -56,7 +56,9 @@ cmake --preset dev \
 ## 平台与 CI
 
 GitHub Actions 使用原生 `ubuntu-24.04` x86_64 和 `ubuntu-24.04-arm` arm64
-runner，以 Clang、CMake 和 Ninja 完成构建、回归测试并保存可执行文件。
+runner，从 LLVM 官方 APT 仓库安装 LLVM 22，以 Clang、CMake 和 Ninja 完成
+构建、回归测试并保存可执行文件。Ubuntu 24.04 自带的 LLVM 18 缺少本项目所用
+的较新 Clang Interpreter API，不能用于该 CI 构建。
 
 Windows 代码路径已使用 `VirtualQuery` 与 `ReadProcessMemory` 实现内存范围检查
 和安全复制，移除了源代码对 `/proc/self/maps`、`process_vm_readv()` 的硬依赖。

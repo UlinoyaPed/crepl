@@ -2706,12 +2706,14 @@ int main()
     // IncrementalCompilerBuilder does not infer Clang's builtin-header
     // directory for an arbitrary embedding executable.  Locate the matching
     // clang++ driver and derive its resource directory (for stddef.h, etc.).
+#if defined(CREPL_CLANG_BINARY)
+    std::string clang_binary = CREPL_CLANG_BINARY;
+#else
     std::string clang_binary = "clang++";
 
-    if (auto path =
-            llvm::sys::findProgramByName("clang++")) {
+    if (auto path = llvm::sys::findProgramByName(clang_binary))
         clang_binary = *path;
-    }
+#endif
 
     std::vector<std::string> clang_arg_storage = {
         "-std=c++20",
