@@ -6,6 +6,7 @@
 #include "clang/Options/OptionUtils.h"
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/LineEditor/LineEditor.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Program.h"
@@ -19,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <optional>
 #include <sstream>
@@ -562,6 +564,13 @@ struct CapturedValue {
 };
 
 
+struct MemoryRegion {
+    std::uintptr_t address;
+    std::size_t size;
+    std::string type;
+};
+
+
 static bool is_identifier(
     llvm::StringRef name
 )
@@ -587,6 +596,7 @@ static llvm::Expected<CapturedValue> capture_expression(
 )
 {
     std::optional<CapturedValue> captured;
+    std::optional<std::string> validation_error;
 
     {
         clang::Value value;
@@ -597,28 +607,26 @@ static llvm::Expected<CapturedValue> capture_expression(
         }
 
         if (!value.hasValue()) {
-            return llvm::createStringError(
-                std::errc::invalid_argument,
-                "expression has no value"
-            );
+            validation_error = "expression has no value";
         }
+        else {
+            std::string type;
+            llvm::raw_string_ostream type_out(type);
+            value.printType(type_out);
+            type_out.flush();
 
-        std::string type;
-        llvm::raw_string_ostream type_out(type);
-        value.printType(type_out);
-        type_out.flush();
+            std::string data;
+            llvm::raw_string_ostream data_out(data);
+            value.printData(data_out);
+            data_out.flush();
 
-        std::string data;
-        llvm::raw_string_ostream data_out(data);
-        value.printData(data_out);
-        data_out.flush();
-
-        captured = CapturedValue{
-            value.getKind(),
-            value.getType()->isArrayType(),
-            type + "\n" + data,
-            value_string(value)
-        };
+            captured = CapturedValue{
+                value.getKind(),
+                value.getType()->isArrayType(),
+                type + "\n" + data,
+                value_string(value)
+            };
+        }
     }
 
     // The evaluation above is an implementation detail.  Remove its PTU so
@@ -626,7 +634,185 @@ static llvm::Expected<CapturedValue> capture_expression(
     if (auto error = interpreter.Undo())
         return std::move(error);
 
+    if (validation_error) {
+        return llvm::createStringError(
+            std::make_error_code(std::errc::invalid_argument),
+            *validation_error
+        );
+    }
+
     return std::move(*captured);
+}
+
+
+static llvm::Expected<MemoryRegion> capture_memory_region(
+    clang::Interpreter& interpreter,
+    llvm::StringRef expression,
+    std::optional<std::size_t> requested_size
+)
+{
+    std::optional<MemoryRegion> region;
+    std::optional<std::string> validation_error;
+    const std::string query = requested_size
+        ? expression.str()
+        : "&(" + expression.str() + ")";
+
+    {
+        clang::Value value;
+
+        if (auto error = interpreter.ParseAndExecute(query, &value))
+            return std::move(error);
+
+        if (!value.hasValue()) {
+            validation_error = "expression has no value";
+        }
+        else {
+            const clang::ASTContext& context = value.getASTContext();
+            clang::QualType type = value.getType();
+            std::uintptr_t address = 0;
+            std::size_t size = 0;
+
+            if (requested_size) {
+                if (type->isPointerType() || type->isArrayType()) {
+                    address =
+                        reinterpret_cast<std::uintptr_t>(value.getPtr());
+                }
+                else if (type->isIntegerType()) {
+                    address = value.convertTo<std::uintptr_t>();
+                }
+                else {
+                    validation_error =
+                        "an explicit byte count requires a pointer, array, "
+                        "or integer address";
+                }
+
+                size = *requested_size;
+            }
+            else if (!type->isPointerType()) {
+                validation_error =
+                    "cannot take the address of this expression";
+            }
+            else {
+                address = reinterpret_cast<std::uintptr_t>(value.getPtr());
+                type = type->getPointeeType();
+                size = static_cast<std::size_t>(
+                    context.getTypeSizeInChars(type).getQuantity()
+                );
+            }
+
+            if (!validation_error) {
+                region = MemoryRegion{
+                    address,
+                    size,
+                    type.getAsString(context.getPrintingPolicy())
+                };
+            }
+        }
+    }
+
+    if (auto error = interpreter.Undo())
+        return std::move(error);
+
+    if (validation_error) {
+        return llvm::createStringError(
+            std::make_error_code(std::errc::invalid_argument),
+            *validation_error
+        );
+    }
+
+    return std::move(*region);
+}
+
+
+static bool is_readable_memory(
+    std::uintptr_t address,
+    std::size_t size
+)
+{
+    if (address == 0 || size == 0 ||
+        address > UINTPTR_MAX - size) {
+        return false;
+    }
+
+    const std::uintptr_t requested_end = address + size;
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+
+    while (std::getline(maps, line)) {
+        std::istringstream fields(line);
+        std::string range;
+        std::string permissions;
+        fields >> range >> permissions;
+
+        const std::size_t dash = range.find('-');
+        if (dash == std::string::npos ||
+            permissions.empty() || permissions.front() != 'r') {
+            continue;
+        }
+
+        std::uintptr_t begin = 0;
+        std::uintptr_t end = 0;
+        std::istringstream(range.substr(0, dash)) >> std::hex >> begin;
+        std::istringstream(range.substr(dash + 1)) >> std::hex >> end;
+
+        if (address >= begin && requested_end <= end)
+            return true;
+    }
+
+    return false;
+}
+
+
+static void print_memory(
+    const MemoryRegion& region
+)
+{
+    llvm::outs()
+        << "address : 0x"
+        << llvm::utohexstr(region.address)
+        << "\n"
+        << "type    : "
+        << region.type
+        << "\n"
+        << "size    : "
+        << region.size
+        << (region.size == 1 ? " byte\n" : " bytes\n")
+        << "\n"
+        << "memory:\n"
+        << "offset   hex   bits\n";
+
+    const auto* bytes =
+        reinterpret_cast<const unsigned char*>(region.address);
+
+    for (std::size_t offset = 0; offset < region.size; ++offset) {
+        const unsigned char byte = bytes[offset];
+        std::ostringstream hex;
+        hex << std::hex
+            << std::nouppercase
+            << std::setfill('0')
+            << std::setw(2)
+            << static_cast<unsigned>(byte);
+
+        llvm::outs()
+            << "+"
+            << offset
+            << std::string(
+                   offset < 10 ? 7 : offset < 100 ? 6 : 5,
+                   ' '
+               )
+            << hex.str()
+            << "    "
+            << group_bits(binary_string(byte))
+            << "\n";
+    }
+
+    const std::uint16_t one = 1;
+    const bool little_endian =
+        *reinterpret_cast<const unsigned char*>(&one) == 1;
+
+    llvm::outs()
+        << "\n"
+        << (little_endian ? "little endian\n" : "big endian\n");
 }
 
 
@@ -866,6 +1052,7 @@ int main()
                 << "%help          show commands\n"
                 << "%watch [name...] watch scalars and C arrays\n"
                 << "%unwatch [name...] stop watching variables\n"
+                << "%mem <name> [bytes] inspect object or pointer memory\n"
                 << "%undo          undo previous input\n"
                 << "%lib <path>    load dynamic library\n"
                 << "%quit          exit\n";
@@ -974,6 +1161,78 @@ int main()
                     );
                     watches.erase(new_end, watches.end());
                 } while (words >> name);
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
+            continue;
+        }
+
+
+        if (
+            input == "%mem" ||
+            llvm::StringRef(input).starts_with("%mem ")
+        ) {
+            const llvm::StringRef arguments = input == "%mem"
+                ? llvm::StringRef()
+                : llvm::StringRef(input).drop_front(5);
+            std::istringstream words(
+                arguments.str()
+            );
+            std::string expression;
+            std::string size_text;
+            std::string extra;
+            words >> expression;
+            words >> size_text;
+            words >> extra;
+
+            if (expression.empty() || !extra.empty()) {
+                llvm::errs()
+                    << "error: usage: %mem <name> [bytes]\n";
+            }
+            else {
+                std::optional<std::size_t> requested_size;
+                std::uint64_t parsed_size = 0;
+
+                if (!size_text.empty()) {
+                    if (llvm::StringRef(size_text).getAsInteger(
+                            0,
+                            parsed_size
+                        ) ||
+                        parsed_size == 0 ||
+                        parsed_size > 65536) {
+                        llvm::errs()
+                            << "error: byte count must be between 1 and "
+                            << "65536\n";
+                    }
+                    else {
+                        requested_size =
+                            static_cast<std::size_t>(parsed_size);
+                    }
+                }
+
+                if (size_text.empty() || requested_size) {
+                    auto region = capture_memory_region(
+                        *interpreter,
+                        expression,
+                        requested_size
+                    );
+
+                    if (!region) {
+                        print_error(region.takeError());
+                    }
+                    else if (!is_readable_memory(
+                                 region->address,
+                                 region->size
+                             )) {
+                        llvm::errs()
+                            << "error: memory range is null, unmapped, or "
+                            << "not readable\n";
+                    }
+                    else {
+                        print_memory(*region);
+                    }
+                }
             }
 
             input.clear();
