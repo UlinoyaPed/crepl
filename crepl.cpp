@@ -1,4 +1,7 @@
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclTemplate.h"
+#include "clang/AST/RecordLayout.h"
 #include "clang/AST/Type.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Interpreter/Interpreter.h"
@@ -24,6 +27,7 @@
 #include <iomanip>
 #include <limits>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -362,6 +366,349 @@ static bool is_readable_memory(
 );
 
 
+struct SequenceInfo {
+    const clang::ASTContext* context;
+    clang::QualType element_type;
+    std::uintptr_t data;
+    std::size_t count;
+};
+
+
+static std::string centered(
+    llvm::StringRef text,
+    std::size_t width
+);
+
+
+static std::optional<std::uint64_t> find_field_bit_offset(
+    const clang::ASTContext& context,
+    const clang::CXXRecordDecl* record,
+    llvm::StringRef field_name,
+    std::uint64_t base_offset,
+    std::set<const clang::CXXRecordDecl*>& active
+)
+{
+    record = record ? record->getDefinition() : nullptr;
+
+    if (!record || !record->isCompleteDefinition() ||
+        !active.insert(record).second) {
+        return std::nullopt;
+    }
+
+    for (const clang::FieldDecl* field : record->fields()) {
+        const std::uint64_t offset =
+            base_offset + context.getFieldOffset(field);
+
+        if (field->getName() == field_name) {
+            active.erase(record);
+            return offset;
+        }
+
+        if (const auto* nested =
+                field->getType()->getAsCXXRecordDecl()) {
+            if (auto found = find_field_bit_offset(
+                    context,
+                    nested,
+                    field_name,
+                    offset,
+                    active
+                )) {
+                active.erase(record);
+                return found;
+            }
+        }
+    }
+
+    const clang::ASTRecordLayout& layout =
+        context.getASTRecordLayout(record);
+
+    for (const clang::CXXBaseSpecifier& base : record->bases()) {
+        const auto* base_record =
+            base.getType()->getAsCXXRecordDecl();
+
+        if (!base_record)
+            continue;
+
+        const std::uint64_t offset = base_offset +
+            static_cast<std::uint64_t>(
+                (base.isVirtual()
+                     ? layout.getVBaseClassOffset(base_record)
+                     : layout.getBaseClassOffset(base_record))
+                    .getQuantity() * CHAR_BIT
+            );
+
+        if (auto found = find_field_bit_offset(
+                context,
+                base_record,
+                field_name,
+                offset,
+                active
+            )) {
+            active.erase(record);
+            return found;
+        }
+    }
+
+    active.erase(record);
+    return std::nullopt;
+}
+
+
+static std::optional<std::uint64_t> find_field_bit_offset(
+    const clang::ASTContext& context,
+    const clang::CXXRecordDecl* record,
+    llvm::StringRef field_name
+)
+{
+    std::set<const clang::CXXRecordDecl*> active;
+    return find_field_bit_offset(
+        context,
+        record,
+        field_name,
+        0,
+        active
+    );
+}
+
+
+static std::optional<SequenceInfo> get_sequence_info(
+    const clang::Value& value
+)
+{
+    const clang::ASTContext& context = value.getASTContext();
+    clang::QualType type = value.getType();
+
+    if (type->isReferenceType())
+        type = type->getPointeeType();
+
+    if (const auto* array = context.getAsConstantArrayType(type)) {
+        return SequenceInfo{
+            &context,
+            array->getElementType(),
+            reinterpret_cast<std::uintptr_t>(value.getPtr()),
+            static_cast<std::size_t>(array->getSize().getZExtValue())
+        };
+    }
+
+    const auto* record = type->getAsCXXRecordDecl();
+    const auto* specialization =
+        llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(
+            record
+        );
+
+    if (!specialization || specialization->getTemplateArgs().size() < 2)
+        return std::nullopt;
+
+    const std::string qualified_name =
+        specialization->getQualifiedNameAsString();
+    const clang::TemplateArgument& element_argument =
+        specialization->getTemplateArgs().get(0);
+
+    if (element_argument.getKind() != clang::TemplateArgument::Type)
+        return std::nullopt;
+
+    const clang::QualType element_type =
+        element_argument.getAsType();
+    const std::uintptr_t object =
+        reinterpret_cast<std::uintptr_t>(value.getPtr());
+
+    if (qualified_name == "std::array") {
+        const clang::TemplateArgument& count_argument =
+            specialization->getTemplateArgs().get(1);
+
+        if (count_argument.getKind() != clang::TemplateArgument::Integral)
+            return std::nullopt;
+
+        const std::size_t count = static_cast<std::size_t>(
+            count_argument.getAsIntegral().getZExtValue()
+        );
+        const auto data_offset =
+            find_field_bit_offset(context, specialization, "_M_elems");
+
+        if (!data_offset)
+            return std::nullopt;
+
+        return SequenceInfo{
+            &context,
+            element_type,
+            object + *data_offset / CHAR_BIT,
+            count
+        };
+    }
+
+    if (qualified_name == "std::vector" &&
+        !element_type->isBooleanType()) {
+        const auto start_offset =
+            find_field_bit_offset(context, specialization, "_M_start");
+        const auto finish_offset =
+            find_field_bit_offset(context, specialization, "_M_finish");
+
+        if (!start_offset || !finish_offset)
+            return std::nullopt;
+
+        const std::uintptr_t start_address =
+            object + *start_offset / CHAR_BIT;
+        const std::uintptr_t finish_address =
+            object + *finish_offset / CHAR_BIT;
+
+        if (!is_readable_memory(start_address, sizeof(std::uintptr_t)) ||
+            !is_readable_memory(finish_address, sizeof(std::uintptr_t))) {
+            return std::nullopt;
+        }
+
+        std::uintptr_t start = 0;
+        std::uintptr_t finish = 0;
+        std::memcpy(
+            &start,
+            reinterpret_cast<const void*>(start_address),
+            sizeof(start)
+        );
+        std::memcpy(
+            &finish,
+            reinterpret_cast<const void*>(finish_address),
+            sizeof(finish)
+        );
+
+        const std::size_t stride = static_cast<std::size_t>(
+            context.getTypeSizeInChars(element_type).getQuantity()
+        );
+
+        if (finish < start || stride == 0 ||
+            (finish - start) % stride != 0) {
+            return std::nullopt;
+        }
+
+        const std::size_t count = (finish - start) / stride;
+
+        if (count > 100000)
+            return std::nullopt;
+
+        return SequenceInfo{&context, element_type, start, count};
+    }
+
+    return std::nullopt;
+}
+
+
+static std::string sequence_element_string(
+    const SequenceInfo& sequence,
+    std::size_t index
+)
+{
+    const std::size_t stride = static_cast<std::size_t>(
+        sequence.context->getTypeSizeInChars(sequence.element_type)
+            .getQuantity()
+    );
+    std::string result;
+    llvm::raw_string_ostream out(result);
+    print_array_element(
+        out,
+        *sequence.context,
+        sequence.element_type,
+        reinterpret_cast<const unsigned char*>(sequence.data) +
+            index * stride
+    );
+    out.flush();
+    return result;
+}
+
+
+static bool print_sequence(
+    llvm::raw_ostream& out,
+    const clang::Value& value
+)
+{
+    const auto sequence = get_sequence_info(value);
+
+    if (!sequence)
+        return false;
+
+    const std::size_t stride = static_cast<std::size_t>(
+        sequence->context->getTypeSizeInChars(sequence->element_type)
+            .getQuantity()
+    );
+
+    if (stride != 0 &&
+        sequence->count >
+            std::numeric_limits<std::size_t>::max() / stride) {
+        return false;
+    }
+
+    if (sequence->count != 0 &&
+        !is_readable_memory(
+            sequence->data,
+            sequence->count * stride
+        )) {
+        return false;
+    }
+
+    out << "(";
+    value.printType(out);
+    out << ") [";
+
+    for (std::size_t index = 0; index < sequence->count; ++index) {
+        if (index != 0)
+            out << ", ";
+        out << sequence_element_string(*sequence, index);
+    }
+
+    out << "]\n";
+    return true;
+}
+
+
+static bool print_sequence_index(
+    llvm::raw_ostream& out,
+    const clang::Value& value
+)
+{
+    const auto sequence = get_sequence_info(value);
+
+    if (!sequence)
+        return false;
+
+    const std::size_t stride = static_cast<std::size_t>(
+        sequence->context->getTypeSizeInChars(sequence->element_type)
+            .getQuantity()
+    );
+
+    if (stride == 0 ||
+        sequence->count >
+            std::numeric_limits<std::size_t>::max() / stride ||
+        (sequence->count != 0 &&
+         !is_readable_memory(
+             sequence->data,
+             sequence->count * stride
+         ))) {
+        return false;
+    }
+
+    std::vector<std::string> indexes;
+    std::vector<std::string> values;
+    std::vector<std::size_t> widths;
+
+    for (std::size_t index = 0; index < sequence->count; ++index) {
+        indexes.push_back(std::to_string(index));
+        values.push_back(sequence_element_string(*sequence, index));
+        widths.push_back(std::max(
+            indexes.back().size(),
+            values.back().size()
+        ));
+    }
+
+    out << "index :";
+    for (std::size_t index = 0; index < sequence->count; ++index)
+        out << " " << centered(indexes[index], widths[index]);
+
+    out << "\nvalue :";
+    for (std::size_t index = 0; index < sequence->count; ++index)
+        out << " " << centered(values[index], widths[index]);
+
+    out << "\n";
+    return true;
+}
+
+
 static std::uint64_t load_integer_bits(
     const unsigned char* data,
     std::size_t size
@@ -521,6 +868,9 @@ static void print_value(
         return;
 
     if (print_pointer(out, value))
+        return;
+
+    if (print_sequence(out, value))
         return;
 
     // enum 保留 Clang 自己的输出。
@@ -718,6 +1068,7 @@ struct CapturedValue {
     clang::Value::Kind kind;
     bool is_array;
     bool is_pointer;
+    bool is_sequence;
     std::string fingerprint;
     std::string rendered;
 };
@@ -792,17 +1143,15 @@ static llvm::Expected<CapturedValue> capture_expression(
             value.printType(type_out);
             type_out.flush();
 
-            std::string data;
-            llvm::raw_string_ostream data_out(data);
-            value.printData(data_out);
-            data_out.flush();
+            const std::string rendered = value_string(value);
 
             captured = CapturedValue{
                 value.getKind(),
                 value.getType()->isArrayType(),
                 value.getType()->isPointerType(),
-                type + "\n" + data,
-                value_string(value)
+                get_sequence_info(value).has_value(),
+                type + "\n" + rendered,
+                rendered
             };
         }
     }
@@ -820,6 +1169,38 @@ static llvm::Expected<CapturedValue> capture_expression(
     }
 
     return std::move(*captured);
+}
+
+
+static llvm::Error print_index_expression(
+    clang::Interpreter& interpreter,
+    llvm::StringRef expression
+)
+{
+    bool printed = false;
+
+    {
+        clang::Value value;
+
+        if (auto error = interpreter.ParseAndExecute(expression, &value))
+            return error;
+
+        if (value.hasValue())
+            printed = print_sequence_index(llvm::outs(), value);
+    }
+
+    if (auto error = interpreter.Undo())
+        return error;
+
+    if (!printed) {
+        return llvm::createStringError(
+            std::errc::invalid_argument,
+            "expression is not a supported C array, std::array, or "
+            "std::vector"
+        );
+    }
+
+    return llvm::Error::success();
 }
 
 
@@ -1445,6 +1826,7 @@ int main()
         auto error =
             interpreter->ParseAndExecute(
                 "#include <iostream>\n"
+                "#include <array>\n"
                 "#include <bitset>\n"
                 "#include <vector>\n"
                 "#include <string>\n"
@@ -1529,6 +1911,7 @@ int main()
                 << "%bits <expr>  show an indexed integer bit view\n"
                 << "%diff <old> <new-expr> compare integer bit patterns\n"
                 << "%type <expr>  show type and integer limits\n"
+                << "%index <expr> show sequence indexes and values\n"
                 << "%undo          undo previous input\n"
                 << "%lib <path>    load dynamic library\n"
                 << "%quit          exit\n";
@@ -1586,6 +1969,31 @@ int main()
                     print_error(info.takeError());
                 else
                     print_type_info(*info);
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
+            continue;
+        }
+
+
+        if (
+            input == "%index" ||
+            llvm::StringRef(input).starts_with("%index ")
+        ) {
+            const llvm::StringRef expression = input == "%index"
+                ? llvm::StringRef()
+                : llvm::StringRef(input).drop_front(7).trim();
+
+            if (expression.empty()) {
+                llvm::errs() << "error: usage: %index <expression>\n";
+            }
+            else if (auto error =
+                         print_index_expression(
+                             *interpreter,
+                             expression
+                         )) {
+                print_error(std::move(error));
             }
 
             input.clear();
@@ -1681,7 +2089,8 @@ int main()
 
                     if (captured->kind == clang::Value::K_PtrOrObj &&
                         !captured->is_array &&
-                        !captured->is_pointer) {
+                        !captured->is_pointer &&
+                        !captured->is_sequence) {
                         llvm::errs()
                             << "error: %watch currently supports scalar "
                             << "and C array variables only: "
