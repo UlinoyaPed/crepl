@@ -559,6 +559,7 @@ struct Watch {
 struct CapturedValue {
     clang::Value::Kind kind;
     bool is_array;
+    bool is_pointer;
     std::string fingerprint;
     std::string rendered;
 };
@@ -623,6 +624,7 @@ static llvm::Expected<CapturedValue> capture_expression(
             captured = CapturedValue{
                 value.getKind(),
                 value.getType()->isArrayType(),
+                value.getType()->isPointerType(),
                 type + "\n" + data,
                 value_string(value)
             };
@@ -1102,7 +1104,8 @@ int main()
                     }
 
                     if (captured->kind == clang::Value::K_PtrOrObj &&
-                        !captured->is_array) {
+                        !captured->is_array &&
+                        !captured->is_pointer) {
                         llvm::errs()
                             << "error: %watch currently supports scalar "
                             << "and C array variables only: "
