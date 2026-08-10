@@ -383,7 +383,8 @@ static void print_array_element(
     llvm::raw_ostream& out,
     const clang::ASTContext& context,
     clang::QualType type,
-    const unsigned char* data
+    const unsigned char* data,
+    std::size_t& remaining_leaves
 );
 
 
@@ -391,7 +392,8 @@ static void print_array_data(
     llvm::raw_ostream& out,
     const clang::ASTContext& context,
     const clang::ConstantArrayType& array,
-    const unsigned char* data
+    const unsigned char* data,
+    std::size_t& remaining_leaves
 )
 {
     const clang::QualType element_type =
@@ -401,23 +403,21 @@ static void print_array_data(
     const std::size_t stride = static_cast<std::size_t>(
         context.getTypeSizeInChars(element_type).getQuantity()
     );
-    const std::uint64_t displayed = std::min<std::uint64_t>(
-        count,
-        sequence_display_limit
-    );
-
     out << "[";
+    std::uint64_t displayed = 0;
 
-    for (std::uint64_t index = 0; index < displayed; ++index) {
-        if (index != 0)
+    while (displayed < count && remaining_leaves != 0) {
+        if (displayed != 0)
             out << ", ";
 
         print_array_element(
             out,
             context,
             element_type,
-            data + index * stride
+            data + displayed * stride,
+            remaining_leaves
         );
+        ++displayed;
     }
 
     if (displayed < count) {
@@ -468,14 +468,25 @@ static void print_array_element(
     llvm::raw_ostream& out,
     const clang::ASTContext& context,
     clang::QualType type,
-    const unsigned char* data
+    const unsigned char* data,
+    std::size_t& remaining_leaves
 )
 {
     if (const auto* nested =
             context.getAsConstantArrayType(type)) {
-        print_array_data(out, context, *nested, data);
+        print_array_data(
+            out,
+            context,
+            *nested,
+            data,
+            remaining_leaves
+        );
         return;
     }
+
+    if (remaining_leaves == 0)
+        return;
+    --remaining_leaves;
 
     const std::size_t size = static_cast<std::size_t>(
         context.getTypeSizeInChars(type).getQuantity()
@@ -534,11 +545,13 @@ static bool print_array(
     value.printType(out);
     reset_color(out);
     out << ") ";
+    std::size_t remaining_leaves = sequence_display_limit;
     print_array_data(
         out,
         context,
         *array,
-        static_cast<const unsigned char*>(value.getPtr())
+        static_cast<const unsigned char*>(value.getPtr()),
+        remaining_leaves
     );
     out << "\n";
     return true;
@@ -868,7 +881,8 @@ static std::optional<SequenceInfo> get_sequence_info(
 static std::string sequence_element_string(
     const SequenceInfo& sequence,
     const unsigned char* data,
-    std::size_t index
+    std::size_t index,
+    std::size_t& remaining_leaves
 )
 {
     const std::size_t stride = static_cast<std::size_t>(
@@ -881,10 +895,49 @@ static std::string sequence_element_string(
         out,
         *sequence.context,
         sequence.element_type,
-        data + index * stride
+        data + index * stride,
+        remaining_leaves
     );
     out.flush();
     return result;
+}
+
+
+static std::optional<std::size_t> sequence_prefix_size(
+    const clang::ASTContext& context,
+    clang::QualType element_type,
+    std::size_t count,
+    std::size_t leaf_limit
+)
+{
+    std::size_t leaves = std::min(count, leaf_limit);
+
+    while (const auto* array =
+               context.getAsConstantArrayType(element_type)) {
+        const std::uint64_t nested_count =
+            array->getSize().getZExtValue();
+
+        if (leaves != 0 &&
+            nested_count > leaf_limit / leaves) {
+            leaves = leaf_limit;
+        }
+        else {
+            leaves *= static_cast<std::size_t>(nested_count);
+        }
+
+        element_type = array->getElementType();
+    }
+
+    const std::size_t leaf_size = static_cast<std::size_t>(
+        context.getTypeSizeInChars(element_type).getQuantity()
+    );
+
+    if (leaf_size != 0 &&
+        leaves > std::numeric_limits<std::size_t>::max() / leaf_size) {
+        return std::nullopt;
+    }
+
+    return leaves * leaf_size;
 }
 
 
@@ -907,13 +960,18 @@ static bool print_sequence(
         sequence_display_limit
     );
 
-    if (stride != 0 &&
-        displayed >
-            std::numeric_limits<std::size_t>::max() / stride) {
+    const auto storage_size = sequence_prefix_size(
+        *sequence->context,
+        sequence->element_type,
+        sequence->count,
+        sequence_display_limit
+    );
+
+    if (!storage_size) {
         return false;
     }
 
-    std::vector<unsigned char> storage(displayed * stride);
+    std::vector<unsigned char> storage(*storage_size);
 
     if (!storage.empty() &&
         !read_memory(
@@ -929,21 +987,25 @@ static bool print_sequence(
     value.printType(out);
     reset_color(out);
     out << ") [";
+    std::size_t remaining_leaves = sequence_display_limit;
+    std::size_t rendered = 0;
 
-    for (std::size_t index = 0; index < displayed; ++index) {
-        if (index != 0)
+    while (rendered < displayed && remaining_leaves != 0) {
+        if (rendered != 0)
             out << ", ";
         out << sequence_element_string(
             *sequence,
             storage.data(),
-            index
+            rendered,
+            remaining_leaves
         );
+        ++rendered;
     }
 
-    if (displayed < sequence->count) {
-        if (displayed != 0)
+    if (rendered < sequence->count) {
+        if (rendered != 0)
             out << ", ";
-        out << "... <" << sequence->count - displayed << " more>";
+        out << "... <" << sequence->count - rendered << " more>";
     }
 
     out << "]\n";
@@ -970,13 +1032,18 @@ static bool print_sequence_index(
         sequence_display_limit
     );
 
-    if (stride == 0 ||
-        displayed >
-            std::numeric_limits<std::size_t>::max() / stride) {
+    const auto storage_size = sequence_prefix_size(
+        *sequence->context,
+        sequence->element_type,
+        sequence->count,
+        sequence_display_limit
+    );
+
+    if (stride == 0 || !storage_size) {
         return false;
     }
 
-    std::vector<unsigned char> storage(displayed * stride);
+    std::vector<unsigned char> storage(*storage_size);
 
     if (!storage.empty() &&
         !read_memory(
@@ -990,13 +1057,17 @@ static bool print_sequence_index(
     std::vector<std::string> indexes;
     std::vector<std::string> values;
     std::vector<std::size_t> widths;
+    std::size_t remaining_leaves = sequence_display_limit;
 
-    for (std::size_t index = 0; index < displayed; ++index) {
+    for (std::size_t index = 0;
+         index < displayed && remaining_leaves != 0;
+         ++index) {
         indexes.push_back(std::to_string(index));
         values.push_back(sequence_element_string(
             *sequence,
             storage.data(),
-            index
+            index,
+            remaining_leaves
         ));
         widths.push_back(std::max(
             indexes.back().size(),
@@ -1005,19 +1076,19 @@ static bool print_sequence_index(
     }
 
     print_label(out, "index :");
-    for (std::size_t index = 0; index < displayed; ++index)
+    for (std::size_t index = 0; index < indexes.size(); ++index)
         out << " " << centered(indexes[index], widths[index]);
 
-    if (displayed < sequence->count)
+    if (indexes.size() < sequence->count)
         out << " ...";
 
     out << "\n";
     print_label(out, "value :");
-    for (std::size_t index = 0; index < displayed; ++index)
+    for (std::size_t index = 0; index < values.size(); ++index)
         out << " " << centered(values[index], widths[index]);
 
-    if (displayed < sequence->count)
-        out << " <" << sequence->count - displayed << " more>";
+    if (values.size() < sequence->count)
+        out << " <" << sequence->count - values.size() << " more>";
 
     out << "\n";
     return true;
@@ -1070,22 +1141,13 @@ static void print_pointer_target(
     );
 
     if (array) {
-        const std::size_t stride = static_cast<std::size_t>(
-            context.getTypeSizeInChars(array->getElementType())
-                .getQuantity()
-        );
-        const std::size_t displayed = std::min<std::size_t>(
+        const auto prefix_size = sequence_prefix_size(
+            context,
+            array->getElementType(),
             static_cast<std::size_t>(array->getSize().getZExtValue()),
             sequence_display_limit
         );
-
-        if (stride != 0 &&
-            displayed > std::numeric_limits<std::size_t>::max() / stride) {
-            read_size = 0;
-        }
-        else {
-            read_size = displayed * stride;
-        }
+        read_size = prefix_size.value_or(0);
     }
     else if (!type->isIntegerType() &&
              !type->isRealFloatingType() &&
@@ -1115,7 +1177,14 @@ static void print_pointer_target(
 
     if (array) {
         print_arrow_type(out, indent, type_name);
-        print_array_data(out, context, *array, data);
+        std::size_t remaining_leaves = sequence_display_limit;
+        print_array_data(
+            out,
+            context,
+            *array,
+            data,
+            remaining_leaves
+        );
         out << "\n";
         return;
     }
@@ -1161,7 +1230,14 @@ static void print_pointer_target(
 
     if (type->isRealFloatingType()) {
         print_arrow_type(out, indent, type_name);
-        print_array_element(out, context, type, data);
+        std::size_t remaining_leaves = 1;
+        print_array_element(
+            out,
+            context,
+            type,
+            data,
+            remaining_leaves
+        );
         out << "\n";
         return;
     }

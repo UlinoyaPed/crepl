@@ -75,6 +75,12 @@ nested_changes=$(grep -c '^nested:$' <<<"$nested_watch_output" || true)
 contains "$nested_watch_output" 'before:' 'nested sequence snapshot diff must include its before state'
 contains "$nested_watch_output" 'after:' 'nested sequence snapshot diff must include its after state'
 
+cube_output=$(run_crepl $'int cube[16][16][16] = {};\ncube\n%watch cube\ncube[0][0][0] = 1;\n%quit\n')
+contains "$cube_output" '... <15 more>' 'multidimensional arrays must share one leaf rendering budget'
+[[ ${#cube_output} -lt 3000 ]] || fail 'multidimensional array output must remain globally bounded'
+cube_changes=$(grep -c '^cube:$' <<<"$cube_output" || true)
+[[ $cube_changes -eq 1 ]] || fail 'bounded multidimensional arrays must remain watchable'
+
 state_output=$(run_crepl $'int n = 1;\n%watch n\n%snapshot before\nn = 2;\n%snapshot after\n%undo\n%state\n%diff before after\n%quit\n')
 contains "$state_output" 'saved snapshot before' 'the before snapshot must be retained'
 contains "$state_output" 'saved snapshot after' 'the after snapshot must be retained'
