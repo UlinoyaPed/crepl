@@ -22,6 +22,7 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -572,6 +573,24 @@ struct MemoryRegion {
 };
 
 
+struct IntegerView {
+    std::string type;
+    unsigned width;
+    std::uint64_t raw;
+};
+
+
+struct TypeInfo {
+    std::string type;
+    std::optional<std::size_t> size;
+    std::optional<std::size_t> alignment;
+    bool is_integer;
+    bool is_boolean;
+    bool is_signed;
+    unsigned width;
+};
+
+
 static bool is_identifier(
     llvm::StringRef name
 )
@@ -723,6 +742,301 @@ static llvm::Expected<MemoryRegion> capture_memory_region(
     }
 
     return std::move(*region);
+}
+
+
+static llvm::Expected<IntegerView> capture_integer(
+    clang::Interpreter& interpreter,
+    llvm::StringRef expression
+)
+{
+    std::optional<IntegerView> result;
+    std::optional<std::string> validation_error;
+
+    {
+        clang::Value value;
+
+        if (auto error = interpreter.ParseAndExecute(expression, &value))
+            return std::move(error);
+
+        if (!value.hasValue()) {
+            validation_error = "expression has no value";
+        }
+        else {
+            const clang::QualType type = value.getType();
+
+            if (!type->isIntegerType() && !type->isEnumeralType()) {
+                validation_error = "expression is not an integer";
+            }
+            else {
+                std::string type_name;
+                llvm::raw_string_ostream type_out(type_name);
+                value.printType(type_out);
+                type_out.flush();
+
+                const unsigned width = static_cast<unsigned>(
+                    value.getASTContext().getTypeSizeInChars(type)
+                        .getQuantity() * CHAR_BIT
+                );
+
+                if (width > 64) {
+                    validation_error =
+                        "integer widths greater than 64 are not supported";
+                }
+                else {
+                    std::uint64_t raw = value.convertTo<std::uint64_t>();
+
+                    if (width < 64)
+                        raw &= (std::uint64_t{1} << width) - 1;
+
+                    result = IntegerView{type_name, width, raw};
+                }
+            }
+        }
+    }
+
+    if (auto error = interpreter.Undo())
+        return std::move(error);
+
+    if (validation_error) {
+        return llvm::createStringError(
+            std::make_error_code(std::errc::invalid_argument),
+            *validation_error
+        );
+    }
+
+    return std::move(*result);
+}
+
+
+static llvm::Expected<TypeInfo> capture_type_info(
+    clang::Interpreter& interpreter,
+    llvm::StringRef expression
+)
+{
+    std::optional<TypeInfo> result;
+    std::optional<std::string> validation_error;
+
+    {
+        clang::Value value;
+
+        if (auto error = interpreter.ParseAndExecute(expression, &value))
+            return std::move(error);
+
+        if (!value.isValid()) {
+            validation_error = "expression has no type";
+        }
+        else {
+            const clang::ASTContext& context = value.getASTContext();
+            clang::QualType type = value.getType();
+
+            if (type->isReferenceType())
+                type = type->getPointeeType();
+
+            const auto size = context.getTypeSizeInCharsIfKnown(type);
+            std::optional<std::size_t> size_bytes;
+            std::optional<std::size_t> alignment_bytes;
+
+            if (size) {
+                size_bytes = static_cast<std::size_t>(size->getQuantity());
+                alignment_bytes = static_cast<std::size_t>(
+                    context.getTypeAlignInChars(type).getQuantity()
+                );
+            }
+
+            const bool is_integer =
+                type->isIntegerType() || type->isEnumeralType();
+            const unsigned width = is_integer && size
+                ? static_cast<unsigned>(size->getQuantity() * CHAR_BIT)
+                : 0;
+
+            result = TypeInfo{
+                type.getAsString(context.getPrintingPolicy()),
+                size_bytes,
+                alignment_bytes,
+                is_integer,
+                type->isBooleanType(),
+                type->isSignedIntegerOrEnumerationType(),
+                width
+            };
+        }
+    }
+
+    if (auto error = interpreter.Undo())
+        return std::move(error);
+
+    if (validation_error) {
+        return llvm::createStringError(
+            std::make_error_code(std::errc::invalid_argument),
+            *validation_error
+        );
+    }
+
+    return std::move(*result);
+}
+
+
+static std::string integer_bits(
+    const IntegerView& value
+)
+{
+    return std::bitset<64>(value.raw)
+        .to_string()
+        .substr(64 - value.width);
+}
+
+
+static std::string centered(
+    llvm::StringRef text,
+    std::size_t width
+)
+{
+    const std::size_t padding = width - text.size();
+    const std::size_t left = padding / 2;
+    return std::string(left, ' ') + text.str() +
+        std::string(padding - left, ' ');
+}
+
+
+static void print_detailed_bits(
+    const IntegerView& value
+)
+{
+    const std::string bits = integer_bits(value);
+    const unsigned nibbles = (value.width + 3) / 4;
+    std::vector<std::string> labels;
+    std::vector<std::size_t> columns;
+
+    for (unsigned index = 0; index < nibbles; ++index) {
+        const unsigned high = value.width - index * 4 - 1;
+        const unsigned low = high >= 3 ? high - 3 : 0;
+        const std::string label =
+            std::to_string(high) + ".." + std::to_string(low);
+        labels.push_back(label);
+        columns.push_back(std::max<std::size_t>(4, label.size()));
+    }
+
+    llvm::outs() << "type : " << value.type << "\nbit  : ";
+
+    for (unsigned index = 0; index < nibbles; ++index) {
+        if (index != 0)
+            llvm::outs() << " ";
+        llvm::outs() << centered(labels[index], columns[index]);
+    }
+
+    llvm::outs() << "\nbits : ";
+
+    for (unsigned index = 0; index < nibbles; ++index) {
+        if (index != 0)
+            llvm::outs() << " ";
+        llvm::outs() << centered(
+            llvm::StringRef(bits).substr(index * 4, 4),
+            columns[index]
+        );
+    }
+
+    llvm::outs() << "\nhex  : ";
+    const std::string hex = hex_string(value.raw)
+        .substr(16 - nibbles);
+
+    for (unsigned index = 0; index < nibbles; ++index) {
+        if (index != 0)
+            llvm::outs() << " ";
+        llvm::outs() << centered(
+            llvm::StringRef(hex).substr(index, 1),
+            columns[index]
+        );
+    }
+
+    llvm::outs() << "\n";
+}
+
+
+static void print_integer_diff(
+    const IntegerView& old_value,
+    const IntegerView& new_value
+)
+{
+    const std::string old_bits = integer_bits(old_value);
+    const std::string new_bits = integer_bits(new_value);
+    std::string difference;
+
+    for (std::size_t index = 0; index < old_bits.size(); ++index) {
+        if (index != 0 &&
+            (old_bits.size() - index) % 4 == 0) {
+            difference += ' ';
+        }
+
+        difference += old_bits[index] == new_bits[index] ? ' ' : '^';
+    }
+
+    llvm::outs()
+        << "old  : " << group_bits(old_bits) << "\n"
+        << "new  : " << group_bits(new_bits) << "\n"
+        << "diff : " << difference << "\n";
+}
+
+
+static std::string integer_limit(
+    bool is_signed,
+    bool minimum,
+    unsigned width
+)
+{
+    if (!is_signed) {
+        if (minimum)
+            return "0";
+
+        const std::uint64_t maximum = width == 64
+            ? std::numeric_limits<std::uint64_t>::max()
+            : (std::uint64_t{1} << width) - 1;
+        return std::to_string(maximum);
+    }
+
+    if (width == 64) {
+        return minimum
+            ? std::to_string(std::numeric_limits<std::int64_t>::min())
+            : std::to_string(std::numeric_limits<std::int64_t>::max());
+    }
+
+    const std::int64_t boundary =
+        std::int64_t{1} << (width - 1);
+    return std::to_string(minimum ? -boundary : boundary - 1);
+}
+
+
+static void print_type_info(
+    const TypeInfo& info
+)
+{
+    llvm::outs() << "type     : " << info.type << "\n";
+
+    if (info.size)
+        llvm::outs() << "size     : " << *info.size << " bytes\n";
+    else
+        llvm::outs() << "size     : incomplete\n";
+
+    if (info.alignment)
+        llvm::outs() << "align    : " << *info.alignment << " bytes\n";
+
+    if (info.is_integer) {
+        const std::string minimum = info.is_boolean
+            ? "0"
+            : integer_limit(info.is_signed, true, info.width);
+        const std::string maximum = info.is_boolean
+            ? "1"
+            : integer_limit(info.is_signed, false, info.width);
+
+        llvm::outs()
+            << "bits     : " << info.width << "\n"
+            << "signed   : " << (info.is_signed ? "yes" : "no") << "\n"
+            << "min      : "
+            << minimum
+            << "\n"
+            << "max      : "
+            << maximum
+            << "\n";
+    }
 }
 
 
@@ -1055,6 +1369,9 @@ int main()
                 << "%watch [name...] watch scalars and C arrays\n"
                 << "%unwatch [name...] stop watching variables\n"
                 << "%mem <name> [bytes] inspect object or pointer memory\n"
+                << "%bits <expr>  show an indexed integer bit view\n"
+                << "%diff <old> <new-expr> compare integer bit patterns\n"
+                << "%type <expr>  show type and integer limits\n"
                 << "%undo          undo previous input\n"
                 << "%lib <path>    load dynamic library\n"
                 << "%quit          exit\n";
@@ -1062,6 +1379,108 @@ int main()
             input.clear();
             editor.setPrompt("crepl> ");
 
+            continue;
+        }
+
+
+        if (
+            input == "%bits" ||
+            llvm::StringRef(input).starts_with("%bits ")
+        ) {
+            const llvm::StringRef expression = input == "%bits"
+                ? llvm::StringRef()
+                : llvm::StringRef(input).drop_front(6).trim();
+
+            if (expression.empty()) {
+                llvm::errs() << "error: usage: %bits <expression>\n";
+            }
+            else {
+                auto integer =
+                    capture_integer(*interpreter, expression);
+
+                if (!integer)
+                    print_error(integer.takeError());
+                else
+                    print_detailed_bits(*integer);
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
+            continue;
+        }
+
+
+        if (
+            input == "%type" ||
+            llvm::StringRef(input).starts_with("%type ")
+        ) {
+            const llvm::StringRef expression = input == "%type"
+                ? llvm::StringRef()
+                : llvm::StringRef(input).drop_front(6).trim();
+
+            if (expression.empty()) {
+                llvm::errs() << "error: usage: %type <expression>\n";
+            }
+            else {
+                auto info =
+                    capture_type_info(*interpreter, expression);
+
+                if (!info)
+                    print_error(info.takeError());
+                else
+                    print_type_info(*info);
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
+            continue;
+        }
+
+
+        if (
+            input == "%diff" ||
+            llvm::StringRef(input).starts_with("%diff ")
+        ) {
+            const llvm::StringRef arguments = input == "%diff"
+                ? llvm::StringRef()
+                : llvm::StringRef(input).drop_front(6).trim();
+            const auto split = arguments.split(' ');
+            const llvm::StringRef old_expression = split.first.trim();
+            const llvm::StringRef new_expression = split.second.trim();
+
+            if (old_expression.empty() || new_expression.empty()) {
+                llvm::errs()
+                    << "error: usage: %diff <old> <new-expression>\n";
+            }
+            else {
+                auto old_value =
+                    capture_integer(*interpreter, old_expression);
+                auto new_value =
+                    capture_integer(*interpreter, new_expression);
+
+                if (!old_value) {
+                    print_error(old_value.takeError());
+                    if (!new_value)
+                        llvm::consumeError(new_value.takeError());
+                }
+                else if (!new_value) {
+                    print_error(new_value.takeError());
+                }
+                else if (old_value->width != new_value->width) {
+                    llvm::errs()
+                        << "error: integer widths differ ("
+                        << old_value->width
+                        << " vs "
+                        << new_value->width
+                        << ")\n";
+                }
+                else {
+                    print_integer_diff(*old_value, *new_value);
+                }
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
             continue;
         }
 
