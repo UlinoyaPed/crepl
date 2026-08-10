@@ -2,8 +2,12 @@ cmake_minimum_required(VERSION 3.20)
 
 project(crepl VERSION 0.1.0 LANGUAGES C CXX)
 
-find_package(LLVM 22 REQUIRED CONFIG)
-find_package(Clang 22 REQUIRED CONFIG)
+find_package(LLVM REQUIRED CONFIG)
+find_package(Clang REQUIRED CONFIG)
+
+if(LLVM_VERSION_MAJOR LESS 22)
+    message(FATAL_ERROR "crepl requires LLVM and Clang 22 or newer")
+endif()
 
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake from ${LLVM_DIR}")
