@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM, Clang, CMake, and Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang \
+            cmake \
+            libclang-cpp-dev \
+            libclang-dev \
+            libedit-dev \
+            llvm-dev \
+            ninja-build \
+            socat
+
+      - name: Configure
+        shell: bash
+        run: |
+          llvm_cmake_dir=$(llvm-config --cmakedir)
+          clang_cmake_dir=${llvm_cmake_dir%/llvm}/clang
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DLLVM_DIR="$llvm_cmake_dir" \
+            -DClang_DIR="$clang_cmake_dir" \
+            -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: crepl-linux-${{ matrix.arch }}
+          path: build/bin/crepl
+          if-no-files-found: error
+
+  windows-sdk-probe:
+    name: Windows SDK probe (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2025
+          - arch: arm64
+            runner: windows-11-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe LLVM and Clang development packages
+        shell: pwsh
+        run: |
+          $llvmRoot = Join-Path $env:ProgramFiles 'LLVM'
+          $llvmConfig = Get-ChildItem $llvmRoot -Filter LLVMConfig.cmake -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $clangConfig = Get-ChildItem $llvmRoot -Filter ClangConfig.cmake -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          "## Windows ${{ matrix.arch }} LLVM SDK probe" | Add-Content $env:GITHUB_STEP_SUMMARY
+          clang++ --version | Out-String | Add-Content $env:GITHUB_STEP_SUMMARY
+
+          if (-not $llvmConfig -or -not $clangConfig) {
+            "The hosted runner has the Clang driver, but no complete LLVM/Clang CMake development package. crepl cannot be linked on this image yet." | Add-Content $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CXX_COMPILER=clang++ `
+            -DLLVM_DIR="$($llvmConfig.DirectoryName)" `
+            -DClang_DIR="$($clangConfig.DirectoryName)" `
+            -DBUILD_TESTING=OFF
+          cmake --build build --parallel 2
+          "A complete SDK was found and the Windows build succeeded." | Add-Content $env:GITHUB_STEP_SUMMARY
