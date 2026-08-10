@@ -61,11 +61,12 @@ runner，以 Clang、CMake 和 Ninja 完成构建、回归测试并保存可执�
 Windows 代码路径已使用 `VirtualQuery` 与 `ReadProcessMemory` 实现内存范围检查
 和安全复制，移除了源代码对 `/proc/self/maps`、`process_vm_readv()` 的硬依赖。
 不过 `crepl` 嵌入实验性的 Clang Interpreter，链接时需要完整 LLVM/Clang
-开发 SDK。GitHub 的 Windows runner 当前预装 Clang 驱动，但标准 LLVM 安装
-通常没有 `LLVMConfig.cmake`、`ClangConfig.cmake`、Interpreter 头文件和链接库，
-因此还不能作为可复现的 Windows 发布目标。workflow 会在 Windows x86_64 和
-arm64 runner 上持续探测这些开发包；一旦 runner 提供完整 SDK，就会自动尝试
-配置和构建。Windows 支持目前应视为实验性且未验证。
+开发 SDK。首次 CI 探测显示，Windows x86_64 runner 没有可用的完整 SDK；
+Windows arm64 预览 runner 虽然带有 CMake package 和链接库，当前仍缺少 LLVM
+目标引用的 ARM64 `diaguids.lib`，构建会在链接前停止。因此 Windows 还不能
+作为可复现的发布目标。workflow 会在两个 Windows 架构上持续探测，SDK 完整
+时自动尝试配置和构建，并把结论写入 job summary。Windows 支持目前应视为
+实验性且未验证。
 
 ## 彩色输出
 

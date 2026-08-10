@@ -45,6 +45,7 @@ jobs:
           clang_cmake_dir=${llvm_cmake_dir%/llvm}/clang
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DLLVM_DIR="$llvm_cmake_dir" \
             -DClang_DIR="$clang_cmake_dir" \
@@ -87,7 +88,12 @@ jobs:
           $clangConfig = Get-ChildItem $llvmRoot -Filter ClangConfig.cmake -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
 
           "## Windows ${{ matrix.arch }} LLVM SDK probe" | Add-Content $env:GITHUB_STEP_SUMMARY
-          clang++ --version | Out-String | Add-Content $env:GITHUB_STEP_SUMMARY
+          $clang = Get-Command clang++.exe -ErrorAction SilentlyContinue
+          if ($clang) {
+            & $clang.Source --version | Out-String | Add-Content $env:GITHUB_STEP_SUMMARY
+          } else {
+            "No clang++ driver was found on PATH." | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
 
           if (-not $llvmConfig -or -not $clangConfig) {
             "The hosted runner has the Clang driver, but no complete LLVM/Clang CMake development package. crepl cannot be linked on this image yet." | Add-Content $env:GITHUB_STEP_SUMMARY
@@ -96,9 +102,20 @@ jobs:
 
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang `
             -DCMAKE_CXX_COMPILER=clang++ `
             -DLLVM_DIR="$($llvmConfig.DirectoryName)" `
             -DClang_DIR="$($clangConfig.DirectoryName)" `
             -DBUILD_TESTING=OFF
+          if ($LASTEXITCODE -ne 0) {
+            "A development SDK was found, but CMake configuration failed. Windows remains experimental." | Add-Content $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+
           cmake --build build --parallel 2
+          if ($LASTEXITCODE -ne 0) {
+            "A development SDK was found, but the build failed. Windows remains experimental." | Add-Content $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+
           "A complete SDK was found and the Windows build succeeded." | Add-Content $env:GITHUB_STEP_SUMMARY
