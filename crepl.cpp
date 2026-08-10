@@ -77,6 +77,26 @@ static void reset_color(
 }
 
 
+static std::optional<std::string> read_input_line(
+    llvm::LineEditor& editor
+)
+{
+    llvm::raw_ostream& out = llvm::outs();
+
+    // Keep escape sequences outside LineEditor::Prompt.  libedit can then
+    // calculate the cursor position from the visible prompt width, while the
+    // terminal color remains active for both the prompt and edited input.
+    set_color(out, llvm::raw_ostream::BRIGHT_GREEN, true);
+    out.flush();
+
+    std::optional<std::string> line = editor.readLine();
+
+    reset_color(out);
+    out.flush();
+    return line;
+}
+
+
 static void print_label(
     llvm::raw_ostream& out,
     llvm::StringRef text
@@ -2731,7 +2751,7 @@ int main()
 
     while (
         std::optional<std::string> line =
-            editor.readLine()
+            read_input_line(editor)
     ) {
         llvm::StringRef current =
             llvm::StringRef(*line).trim();

@@ -41,6 +41,7 @@ type_output=$(run_crepl $'int x = 1;\n%type ++x\nx\n%undo\nx\n%quit\n')
 type_values=$(grep -Fc '(int) 1' <<<"$type_output")
 [[ $type_values -eq 2 ]] || fail '%type must not evaluate ++x or consume user undo history'
 contains "$type_output" 'type     : int' '%type must report the canonical type'
+[[ $type_output != *$'\033'* ]] || fail 'piped input and output must not contain ANSI colors'
 
 allocator_output=$(run_crepl $'#include <vector>\n#include <cstddef>\ntemplate<class T> struct Mine { using value_type=T; Mine()=default; template<class U> Mine(const Mine<U>&) {} T* allocate(std::size_t n) { return static_cast<T*>(::operator new(n*sizeof(T))); } void deallocate(T* p, std::size_t) { ::operator delete(p); } };\nstd::vector<int, Mine<int>> v = {1,2,3};\nv\n%index v\n%quit\n')
 contains "$allocator_output" '(std::vector<int, Mine<int> > &) @' 'custom allocator vectors must use the Clang fallback printer'
