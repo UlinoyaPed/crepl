@@ -38,6 +38,9 @@
 #include <utility>
 #include <vector>
 
+#include <sys/uio.h>
+#include <unistd.h>
+
 
 // ============================================================
 // 二进制 / 十六进制格式化
@@ -526,6 +529,13 @@ static bool is_readable_memory(
 );
 
 
+static bool read_memory(
+    std::uintptr_t address,
+    void* destination,
+    std::size_t size
+);
+
+
 struct SequenceInfo {
     const clang::ASTContext* context;
     clang::QualType element_type;
@@ -802,16 +812,10 @@ static std::optional<SequenceInfo> get_sequence_info(
 
         std::uintptr_t start = 0;
         std::uintptr_t finish = 0;
-        std::memcpy(
-            &start,
-            reinterpret_cast<const void*>(start_address),
-            sizeof(start)
-        );
-        std::memcpy(
-            &finish,
-            reinterpret_cast<const void*>(finish_address),
-            sizeof(finish)
-        );
+        if (!read_memory(start_address, &start, sizeof(start)) ||
+            !read_memory(finish_address, &finish, sizeof(finish))) {
+            return std::nullopt;
+        }
 
         const std::size_t stride = static_cast<std::size_t>(
             context.getTypeSizeInChars(element_type).getQuantity()
@@ -833,6 +837,7 @@ static std::optional<SequenceInfo> get_sequence_info(
 
 static std::string sequence_element_string(
     const SequenceInfo& sequence,
+    const unsigned char* data,
     std::size_t index
 )
 {
@@ -846,8 +851,7 @@ static std::string sequence_element_string(
         out,
         *sequence.context,
         sequence.element_type,
-        reinterpret_cast<const unsigned char*>(sequence.data) +
-            index * stride
+        data + index * stride
     );
     out.flush();
     return result;
@@ -879,10 +883,13 @@ static bool print_sequence(
         return false;
     }
 
-    if (displayed != 0 &&
-        !is_readable_memory(
+    std::vector<unsigned char> storage(displayed * stride);
+
+    if (!storage.empty() &&
+        !read_memory(
             sequence->data,
-            displayed * stride
+            storage.data(),
+            storage.size()
         )) {
         return false;
     }
@@ -896,7 +903,11 @@ static bool print_sequence(
     for (std::size_t index = 0; index < displayed; ++index) {
         if (index != 0)
             out << ", ";
-        out << sequence_element_string(*sequence, index);
+        out << sequence_element_string(
+            *sequence,
+            storage.data(),
+            index
+        );
     }
 
     if (displayed < sequence->count) {
@@ -931,12 +942,18 @@ static bool print_sequence_index(
 
     if (stride == 0 ||
         displayed >
-            std::numeric_limits<std::size_t>::max() / stride ||
-        (displayed != 0 &&
-         !is_readable_memory(
-             sequence->data,
-             displayed * stride
-         ))) {
+            std::numeric_limits<std::size_t>::max() / stride) {
+        return false;
+    }
+
+    std::vector<unsigned char> storage(displayed * stride);
+
+    if (!storage.empty() &&
+        !read_memory(
+            sequence->data,
+            storage.data(),
+            storage.size()
+        )) {
         return false;
     }
 
@@ -946,7 +963,11 @@ static bool print_sequence_index(
 
     for (std::size_t index = 0; index < displayed; ++index) {
         indexes.push_back(std::to_string(index));
-        values.push_back(sequence_element_string(*sequence, index));
+        values.push_back(sequence_element_string(
+            *sequence,
+            storage.data(),
+            index
+        ));
         widths.push_back(std::max(
             indexes.back().size(),
             values.back().size()
@@ -1001,11 +1022,7 @@ static void print_pointer_target(
 
     const auto size = context.getTypeSizeInCharsIfKnown(type);
 
-    if (!size ||
-        !is_readable_memory(
-            address,
-            static_cast<std::size_t>(size->getQuantity())
-        )) {
+    if (!size) {
         out << indent;
         print_heading(out, "->");
         set_color(out, llvm::raw_ostream::BRIGHT_RED, true);
@@ -1015,12 +1032,58 @@ static void print_pointer_target(
         return;
     }
 
-    const auto* data =
-        reinterpret_cast<const unsigned char*>(address);
     const std::string type_name =
         type.getAsString(context.getPrintingPolicy());
+    const auto* array = context.getAsConstantArrayType(type);
+    std::size_t read_size = static_cast<std::size_t>(
+        size->getQuantity()
+    );
 
-    if (const auto* array = context.getAsConstantArrayType(type)) {
+    if (array) {
+        const std::size_t stride = static_cast<std::size_t>(
+            context.getTypeSizeInChars(array->getElementType())
+                .getQuantity()
+        );
+        const std::size_t displayed = std::min<std::size_t>(
+            static_cast<std::size_t>(array->getSize().getZExtValue()),
+            sequence_display_limit
+        );
+
+        if (stride != 0 &&
+            displayed > std::numeric_limits<std::size_t>::max() / stride) {
+            read_size = 0;
+        }
+        else {
+            read_size = displayed * stride;
+        }
+    }
+    else if (!type->isIntegerType() &&
+             !type->isRealFloatingType() &&
+             !type->isPointerType()) {
+        print_arrow_type(out, indent, type_name);
+        set_color(out, llvm::raw_ostream::BRIGHT_MAGENTA);
+        out << "@0x" << llvm::utohexstr(address);
+        reset_color(out);
+        out << "\n";
+        return;
+    }
+
+    std::vector<unsigned char> storage(read_size);
+
+    if (read_size != 0 &&
+        !read_memory(address, storage.data(), storage.size())) {
+        out << indent;
+        print_heading(out, "->");
+        set_color(out, llvm::raw_ostream::BRIGHT_RED, true);
+        out << " <unreadable>";
+        reset_color(out);
+        out << "\n";
+        return;
+    }
+
+    const unsigned char* data = storage.data();
+
+    if (array) {
         print_arrow_type(out, indent, type_name);
         print_array_data(out, context, *array, data);
         out << "\n";
@@ -1095,11 +1158,6 @@ static void print_pointer_target(
         return;
     }
 
-    print_arrow_type(out, indent, type_name);
-    set_color(out, llvm::raw_ostream::BRIGHT_MAGENTA);
-    out << "@0x" << llvm::utohexstr(address);
-    reset_color(out);
-    out << "\n";
 }
 
 
@@ -2239,10 +2297,48 @@ static bool is_readable_memory(
 }
 
 
-static void print_memory(
+static bool read_memory(
+    std::uintptr_t address,
+    void* destination,
+    std::size_t size
+)
+{
+    if (size == 0)
+        return true;
+
+    if (!destination || !is_readable_memory(address, size))
+        return false;
+
+    iovec local{
+        destination,
+        size
+    };
+    iovec remote{
+        reinterpret_cast<void*>(address),
+        size
+    };
+    const ssize_t copied = process_vm_readv(
+        getpid(),
+        &local,
+        1,
+        &remote,
+        1,
+        0
+    );
+
+    return copied >= 0 && static_cast<std::size_t>(copied) == size;
+}
+
+
+static bool print_memory(
     const MemoryRegion& region
 )
 {
+    std::vector<unsigned char> bytes(region.size);
+
+    if (!read_memory(region.address, bytes.data(), bytes.size()))
+        return false;
+
     llvm::raw_ostream& out = llvm::outs();
     print_label(out, "address : ");
     set_color(out, llvm::raw_ostream::BRIGHT_MAGENTA);
@@ -2260,9 +2356,6 @@ static void print_memory(
     out << "\n";
     print_label(out, "offset   hex   bits");
     out << "\n";
-
-    const auto* bytes =
-        reinterpret_cast<const unsigned char*>(region.address);
 
     for (std::size_t offset = 0; offset < region.size; ++offset) {
         const unsigned char byte = bytes[offset];
@@ -2297,6 +2390,7 @@ static void print_memory(
         little_endian ? "little endian" : "big endian"
     );
     out << "\n";
+    return true;
 }
 
 
@@ -3202,7 +3296,11 @@ int main()
                             << "not readable\n";
                     }
                     else {
-                        print_memory(*region);
+                        if (!print_memory(*region)) {
+                            llvm::errs()
+                                << "error: memory changed or could not be "
+                                << "copied safely\n";
+                        }
                     }
                 }
             }
