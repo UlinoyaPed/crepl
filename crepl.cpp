@@ -3633,7 +3633,6 @@ int main()
         // ----------------------------------------------------
 
         clang::Value value;
-        std::optional<std::string> result_output;
         bool execution_succeeded = false;
 
         if (
@@ -3648,7 +3647,6 @@ int main()
             );
         }
         else if (value.hasValue()) {
-            result_output = value_string(value);
             execution_succeeded = true;
         }
         else {
@@ -3657,11 +3655,11 @@ int main()
 
         if (execution_succeeded) {
             history.push_back(input);
-            const bool watched_changed =
-                refresh_watches(*interpreter, watches);
 
-            if (!watched_changed && result_output)
+            if (value.hasValue())
                 print_value(llvm::outs(), value);
+
+            refresh_watches(*interpreter, watches);
         }
 
 

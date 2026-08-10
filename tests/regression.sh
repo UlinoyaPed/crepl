@@ -85,6 +85,15 @@ memory_limit_output=$(run_crepl $'char big[65537] = {};\n%mem big\n%quit\n')
 contains "$memory_limit_output" 'byte count must be between 1 and 65536' 'default %mem object sizes must respect the display limit'
 [[ $memory_limit_output != *'address :'* ]] || fail 'oversized default %mem requests must not read or render memory'
 
+postincrement_output=$(run_crepl $'int watched = 1;\n%watch watched\nwatched++\n%quit\n')
+postincrement_old=$(grep -Fc '(int) 1' <<<"$postincrement_output")
+postincrement_new=$(grep -Fc '(int) 2' <<<"$postincrement_output")
+[[ $postincrement_old -eq 1 && $postincrement_new -eq 1 ]] ||
+    fail 'a watched post-increment must print both its result and new state'
+result_line=$(grep -n -m1 -F '(int) 1' <<<"$postincrement_output" | cut -d: -f1)
+watch_line=$(grep -n -m1 -F 'watched:' <<<"$postincrement_output" | cut -d: -f1)
+[[ $result_line -lt $watch_line ]] || fail 'expression results must precede watch updates'
+
 state_output=$(run_crepl $'int n = 1;\n%watch n\n%snapshot before\nn = 2;\n%snapshot after\n%undo\n%state\n%diff before after\n%quit\n')
 contains "$state_output" 'saved snapshot before' 'the before snapshot must be retained'
 contains "$state_output" 'saved snapshot after' 'the after snapshot must be retained'
