@@ -1,3 +1,4 @@
+#include "clang/AST/ASTContext.h"
 #include "clang/AST/Type.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Interpreter/Interpreter.h"
@@ -16,6 +17,8 @@
 #include <cctype>
 #include <climits>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <optional>
 #include <sstream>
@@ -195,12 +198,169 @@ static void print_integer(
 // bool / float / double / pointer / object：Clang 原来的 printer
 // ============================================================
 
+static void print_array_element(
+    llvm::raw_ostream& out,
+    const clang::ASTContext& context,
+    clang::QualType type,
+    const unsigned char* data
+);
+
+
+static void print_array_data(
+    llvm::raw_ostream& out,
+    const clang::ASTContext& context,
+    const clang::ConstantArrayType& array,
+    const unsigned char* data
+)
+{
+    const clang::QualType element_type =
+        array.getElementType();
+    const std::uint64_t count =
+        array.getSize().getZExtValue();
+    const std::size_t stride = static_cast<std::size_t>(
+        context.getTypeSizeInChars(element_type).getQuantity()
+    );
+
+    out << "[";
+
+    for (std::uint64_t index = 0; index < count; ++index) {
+        if (index != 0)
+            out << ", ";
+
+        print_array_element(
+            out,
+            context,
+            element_type,
+            data + index * stride
+        );
+    }
+
+    out << "]";
+}
+
+
+static void print_array_integer(
+    llvm::raw_ostream& out,
+    clang::QualType type,
+    const unsigned char* data,
+    std::size_t size
+)
+{
+    std::uint64_t raw = 0;
+    std::memcpy(&raw, data, size);
+
+    if (type->isBooleanType()) {
+        out << (raw == 0 ? "false" : "true");
+        return;
+    }
+
+    if (!type->isSignedIntegerType()) {
+        out << raw;
+        return;
+    }
+
+    if (size == sizeof(std::int64_t)) {
+        std::int64_t signed_value = 0;
+        std::memcpy(&signed_value, data, sizeof(signed_value));
+        out << signed_value;
+        return;
+    }
+
+    const unsigned bits = static_cast<unsigned>(size * CHAR_BIT);
+    const std::uint64_t sign = std::uint64_t{1} << (bits - 1);
+    const std::int64_t signed_value =
+        static_cast<std::int64_t>((raw ^ sign) - sign);
+    out << signed_value;
+}
+
+
+static void print_array_element(
+    llvm::raw_ostream& out,
+    const clang::ASTContext& context,
+    clang::QualType type,
+    const unsigned char* data
+)
+{
+    if (const auto* nested =
+            context.getAsConstantArrayType(type)) {
+        print_array_data(out, context, *nested, data);
+        return;
+    }
+
+    const std::size_t size = static_cast<std::size_t>(
+        context.getTypeSizeInChars(type).getQuantity()
+    );
+
+    if (type->isIntegerType() && size <= sizeof(std::uint64_t)) {
+        print_array_integer(out, type, data, size);
+        return;
+    }
+
+    if (type->isRealFloatingType()) {
+        if (size == sizeof(float)) {
+            float number = 0;
+            std::memcpy(&number, data, sizeof(number));
+            out << number;
+            return;
+        }
+
+        if (size == sizeof(double)) {
+            double number = 0;
+            std::memcpy(&number, data, sizeof(number));
+            out << number;
+            return;
+        }
+
+        if (size == sizeof(long double)) {
+            long double number = 0;
+            std::memcpy(&number, data, sizeof(number));
+            std::ostringstream formatted;
+            formatted << number;
+            out << formatted.str();
+            return;
+        }
+    }
+
+    // Keep the shape useful even when an element type is not yet printable.
+    out << "<value>";
+}
+
+
+static bool print_array(
+    llvm::raw_ostream& out,
+    const clang::Value& value
+)
+{
+    const clang::ASTContext& context =
+        value.getASTContext();
+    const auto* array =
+        context.getAsConstantArrayType(value.getType());
+
+    if (!array)
+        return false;
+
+    out << "(";
+    value.printType(out);
+    out << ") ";
+    print_array_data(
+        out,
+        context,
+        *array,
+        static_cast<const unsigned char*>(value.getPtr())
+    );
+    out << "\n";
+    return true;
+}
+
 static void print_value(
     llvm::raw_ostream& out,
     const clang::Value& value
 )
 {
     if (!value.hasValue())
+        return;
+
+    if (print_array(out, value))
         return;
 
     // enum 保留 Clang 自己的输出。
@@ -396,6 +556,7 @@ struct Watch {
 
 struct CapturedValue {
     clang::Value::Kind kind;
+    bool is_array;
     std::string fingerprint;
     std::string rendered;
 };
@@ -454,6 +615,7 @@ static llvm::Expected<CapturedValue> capture_expression(
 
         captured = CapturedValue{
             value.getKind(),
+            value.getType()->isArrayType(),
             type + "\n" + data,
             value_string(value)
         };
@@ -702,7 +864,7 @@ int main()
 
             llvm::outs()
                 << "%help          show commands\n"
-                << "%watch [name...] watch scalar variables\n"
+                << "%watch [name...] watch scalars and C arrays\n"
                 << "%unwatch [name...] stop watching variables\n"
                 << "%undo          undo previous input\n"
                 << "%lib <path>    load dynamic library\n"
@@ -752,10 +914,11 @@ int main()
                         continue;
                     }
 
-                    if (captured->kind == clang::Value::K_PtrOrObj) {
+                    if (captured->kind == clang::Value::K_PtrOrObj &&
+                        !captured->is_array) {
                         llvm::errs()
                             << "error: %watch currently supports scalar "
-                            << "variables only: "
+                            << "and C array variables only: "
                             << name
                             << "\n";
                         continue;
