@@ -53,7 +53,7 @@ static bool can_color(
     llvm::raw_ostream& out
 )
 {
-    return color_output && out.has_colors();
+    return color_output && out.colors_enabled();
 }
 
 
@@ -2614,9 +2614,11 @@ static void print_error(
 
 int main()
 {
+    const char* term = std::getenv("TERM");
     color_output =
         std::getenv("NO_COLOR") == nullptr &&
-        llvm::outs().has_colors();
+        llvm::outs().is_displayed() &&
+        (!term || llvm::StringRef(term) != "dumb");
     llvm::outs().enable_colors(color_output);
     llvm::errs().enable_colors(color_output);
 

@@ -43,6 +43,16 @@ type_values=$(grep -Fc '(int) 1' <<<"$type_output")
 contains "$type_output" 'type     : int' '%type must report the canonical type'
 [[ $type_output != *$'\033'* ]] || fail 'piped input and output must not contain ANSI colors'
 
+if command -v socat >/dev/null 2>&1; then
+    pty_output=$(
+        printf '%%quit\n' |
+            socat -,ignoreeof \
+                EXEC:"env -u NO_COLOR TERM=alacritty $binary",pty,setsid,ctty
+    )
+    [[ $pty_output == *$'\033['* ]] ||
+        fail 'an interactive alacritty PTY must contain ANSI colors'
+fi
+
 allocator_output=$(run_crepl $'#include <vector>\n#include <cstddef>\ntemplate<class T> struct Mine { using value_type=T; Mine()=default; template<class U> Mine(const Mine<U>&) {} T* allocate(std::size_t n) { return static_cast<T*>(::operator new(n*sizeof(T))); } void deallocate(T* p, std::size_t) { ::operator delete(p); } };\nstd::vector<int, Mine<int>> v = {1,2,3};\nv\n%index v\n%quit\n')
 contains "$allocator_output" '(std::vector<int, Mine<int> > &) @' 'custom allocator vectors must use the Clang fallback printer'
 contains "$allocator_output" 'expression is not a supported C array, std::array, or std::vector' '%index must reject an unsupported vector ABI'
