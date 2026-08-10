@@ -721,12 +721,11 @@ static std::optional<FieldLocation> find_field_location(
 
 
 static std::optional<SequenceInfo> get_sequence_info(
-    const clang::Value& value
+    const clang::ASTContext& context,
+    clang::QualType type,
+    std::uintptr_t object
 )
 {
-    const clang::ASTContext& context = value.getASTContext();
-    clang::QualType type = value.getType();
-
     if (type->isReferenceType())
         type = type->getPointeeType();
 
@@ -734,7 +733,7 @@ static std::optional<SequenceInfo> get_sequence_info(
         return SequenceInfo{
             &context,
             array->getElementType(),
-            reinterpret_cast<std::uintptr_t>(value.getPtr()),
+            object,
             static_cast<std::size_t>(array->getSize().getZExtValue())
         };
     }
@@ -758,9 +757,6 @@ static std::optional<SequenceInfo> get_sequence_info(
 
     const clang::QualType element_type =
         element_argument.getAsType();
-    const std::uintptr_t object =
-        reinterpret_cast<std::uintptr_t>(value.getPtr());
-
     if (qualified_name == "std::array") {
         const clang::TemplateArgument& count_argument =
             specialization->getTemplateArgs().get(1);
@@ -854,6 +850,18 @@ static std::optional<SequenceInfo> get_sequence_info(
     }
 
     return std::nullopt;
+}
+
+
+static std::optional<SequenceInfo> get_sequence_info(
+    const clang::Value& value
+)
+{
+    return get_sequence_info(
+        value.getASTContext(),
+        value.getType(),
+        reinterpret_cast<std::uintptr_t>(value.getPtr())
+    );
 }
 
 
@@ -1430,6 +1438,145 @@ static std::string value_string(
 }
 
 
+struct FingerprintBudget {
+    std::size_t leaves = sequence_display_limit;
+    std::size_t bytes = 65536;
+};
+
+
+static void append_fingerprint_number(
+    std::string& fingerprint,
+    std::uint64_t number
+)
+{
+    fingerprint += std::to_string(number);
+    fingerprint += ';';
+}
+
+
+static void append_object_fingerprint(
+    const clang::ASTContext& context,
+    clang::QualType type,
+    std::uintptr_t address,
+    FingerprintBudget& budget,
+    std::string& fingerprint
+)
+{
+    if (type->isReferenceType())
+        type = type->getPointeeType();
+    type = type.getCanonicalType();
+
+    const std::string type_name =
+        type.getAsString(context.getPrintingPolicy());
+    fingerprint += 'T';
+    append_fingerprint_number(fingerprint, type_name.size());
+    fingerprint += type_name;
+
+    if (const auto sequence =
+            get_sequence_info(context, type, address)) {
+        fingerprint += 'S';
+        append_fingerprint_number(fingerprint, sequence->count);
+
+        const std::size_t stride = static_cast<std::size_t>(
+            context.getTypeSizeInChars(sequence->element_type)
+                .getQuantity()
+        );
+        std::size_t index = 0;
+
+        while (index < sequence->count && budget.leaves != 0) {
+            if (stride == 0 ||
+                index >
+                    (std::numeric_limits<std::uintptr_t>::max() -
+                     sequence->data) /
+                        stride) {
+                fingerprint += "invalid;";
+                return;
+            }
+
+            append_object_fingerprint(
+                context,
+                sequence->element_type,
+                sequence->data + index * stride,
+                budget,
+                fingerprint
+            );
+            ++index;
+        }
+
+        fingerprint += 'R';
+        append_fingerprint_number(
+            fingerprint,
+            sequence->count - index
+        );
+        return;
+    }
+
+    if (budget.leaves == 0) {
+        fingerprint += "budget;";
+        return;
+    }
+    --budget.leaves;
+
+    const auto size = context.getTypeSizeInCharsIfKnown(type);
+
+    if (!size) {
+        fingerprint += "incomplete;";
+        return;
+    }
+
+    const std::size_t object_size = static_cast<std::size_t>(
+        size->getQuantity()
+    );
+    const std::size_t copied_size = std::min(object_size, budget.bytes);
+    fingerprint += 'O';
+    append_fingerprint_number(fingerprint, object_size);
+    append_fingerprint_number(fingerprint, copied_size);
+
+    if (copied_size == 0) {
+        fingerprint += "budget;";
+        return;
+    }
+
+    std::vector<unsigned char> bytes(copied_size);
+
+    if (!read_memory(address, bytes.data(), bytes.size())) {
+        fingerprint += "unreadable;";
+        append_fingerprint_number(fingerprint, address);
+        return;
+    }
+
+    budget.bytes -= copied_size;
+    fingerprint.append(
+        reinterpret_cast<const char*>(bytes.data()),
+        bytes.size()
+    );
+}
+
+
+static std::string value_fingerprint(
+    const clang::Value& value,
+    llvm::StringRef type_name,
+    llvm::StringRef rendered
+)
+{
+    if (value.getKind() != clang::Value::K_PtrOrObj ||
+        value.getType()->isPointerType()) {
+        return (type_name + "\n" + rendered).str();
+    }
+
+    FingerprintBudget budget;
+    std::string fingerprint;
+    append_object_fingerprint(
+        value.getASTContext(),
+        value.getType(),
+        reinterpret_cast<std::uintptr_t>(value.getPtr()),
+        budget,
+        fingerprint
+    );
+    return fingerprint;
+}
+
+
 static void print_error(llvm::Error error);
 
 
@@ -1644,13 +1791,18 @@ static llvm::Expected<CapturedValue> capture_expression(
             type_out.flush();
 
             const std::string rendered = value_string(value);
+            const std::string fingerprint = value_fingerprint(
+                value,
+                type,
+                rendered
+            );
 
             captured = CapturedValue{
                 value.getKind(),
                 value.getType()->isArrayType(),
                 value.getType()->isPointerType(),
                 get_sequence_info(value).has_value(),
-                type + "\n" + rendered,
+                fingerprint,
                 rendered
             };
         }

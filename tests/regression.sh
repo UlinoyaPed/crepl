@@ -69,6 +69,12 @@ contains "$sequence_output" '... <44 more>' 'large sequences must report truncat
 watch_changes=$(grep -c '^a:$' <<<"$sequence_output" || true)
 [[ $watch_changes -eq 1 ]] || fail 'watch fingerprints must be bounded to the displayed sequence prefix'
 
+nested_watch_output=$(run_crepl $'#include <vector>\nstd::vector<std::vector<int>> nested{{1}};\n%watch nested\n%snapshot nested_before\nnested[0][0] = 2;\n%snapshot nested_after\n%diff nested_before nested_after\n%quit\n')
+nested_changes=$(grep -c '^nested:$' <<<"$nested_watch_output" || true)
+[[ $nested_changes -eq 2 ]] || fail 'nested vector changes must affect watch and snapshot fingerprints'
+contains "$nested_watch_output" 'before:' 'nested sequence snapshot diff must include its before state'
+contains "$nested_watch_output" 'after:' 'nested sequence snapshot diff must include its after state'
+
 state_output=$(run_crepl $'int n = 1;\n%watch n\n%snapshot before\nn = 2;\n%snapshot after\n%undo\n%state\n%diff before after\n%quit\n')
 contains "$state_output" 'saved snapshot before' 'the before snapshot must be retained'
 contains "$state_output" 'saved snapshot after' 'the after snapshot must be retained'
