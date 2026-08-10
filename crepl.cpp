@@ -500,13 +500,19 @@ struct SequenceInfo {
 };
 
 
+struct FieldLocation {
+    const clang::FieldDecl* field;
+    std::uint64_t bit_offset;
+};
+
+
 static std::string centered(
     llvm::StringRef text,
     std::size_t width
 );
 
 
-static std::optional<std::uint64_t> find_field_bit_offset(
+static std::optional<FieldLocation> find_field_location(
     const clang::ASTContext& context,
     const clang::CXXRecordDecl* record,
     llvm::StringRef field_name,
@@ -527,12 +533,12 @@ static std::optional<std::uint64_t> find_field_bit_offset(
 
         if (field->getName() == field_name) {
             active.erase(record);
-            return offset;
+            return FieldLocation{field, offset};
         }
 
         if (const auto* nested =
                 field->getType()->getAsCXXRecordDecl()) {
-            if (auto found = find_field_bit_offset(
+            if (auto found = find_field_location(
                     context,
                     nested,
                     field_name,
@@ -563,7 +569,7 @@ static std::optional<std::uint64_t> find_field_bit_offset(
                     .getQuantity() * CHAR_BIT
             );
 
-        if (auto found = find_field_bit_offset(
+        if (auto found = find_field_location(
                 context,
                 base_record,
                 field_name,
@@ -580,14 +586,65 @@ static std::optional<std::uint64_t> find_field_bit_offset(
 }
 
 
-static std::optional<std::uint64_t> find_field_bit_offset(
+static bool is_std_allocator_for(
+    const clang::ASTContext& context,
+    const clang::TemplateArgument& allocator_argument,
+    clang::QualType element_type
+)
+{
+    if (allocator_argument.getKind() != clang::TemplateArgument::Type)
+        return false;
+
+    const auto* allocator_record =
+        allocator_argument.getAsType()->getAsCXXRecordDecl();
+    const auto* allocator_specialization =
+        llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(
+            allocator_record
+        );
+
+    if (!allocator_specialization ||
+        allocator_specialization->getQualifiedNameAsString() !=
+            "std::allocator" ||
+        allocator_specialization->getTemplateArgs().size() != 1) {
+        return false;
+    }
+
+    const clang::TemplateArgument& allocated_type =
+        allocator_specialization->getTemplateArgs().get(0);
+
+    return allocated_type.getKind() == clang::TemplateArgument::Type &&
+        context.hasSameType(allocated_type.getAsType(), element_type);
+}
+
+
+static bool is_native_element_pointer(
+    const clang::ASTContext& context,
+    const clang::FieldDecl& field,
+    clang::QualType element_type
+)
+{
+    const clang::QualType field_type = field.getType();
+    const auto* pointer_type =
+        field_type->getAs<clang::PointerType>();
+
+    return pointer_type != nullptr &&
+        context.getTypeSizeInChars(field_type).getQuantity() ==
+            static_cast<std::int64_t>(sizeof(std::uintptr_t)) &&
+        context.hasSameType(
+            pointer_type->getPointeeType(),
+            element_type
+        );
+}
+
+
+static std::optional<FieldLocation> find_field_location(
     const clang::ASTContext& context,
     const clang::CXXRecordDecl* record,
     llvm::StringRef field_name
 )
 {
     std::set<const clang::CXXRecordDecl*> active;
-    return find_field_bit_offset(
+    return find_field_location(
         context,
         record,
         field_name,
@@ -649,7 +706,7 @@ static std::optional<SequenceInfo> get_sequence_info(
             count_argument.getAsIntegral().getZExtValue()
         );
         const auto data_offset =
-            find_field_bit_offset(context, specialization, "_M_elems");
+            find_field_location(context, specialization, "_M_elems");
 
         if (!data_offset)
             return std::nullopt;
@@ -657,25 +714,52 @@ static std::optional<SequenceInfo> get_sequence_info(
         return SequenceInfo{
             &context,
             element_type,
-            object + *data_offset / CHAR_BIT,
+            object + data_offset->bit_offset / CHAR_BIT,
             count
         };
     }
 
     if (qualified_name == "std::vector" &&
         !element_type->isBooleanType()) {
-        const auto start_offset =
-            find_field_bit_offset(context, specialization, "_M_start");
-        const auto finish_offset =
-            find_field_bit_offset(context, specialization, "_M_finish");
+        if (!is_std_allocator_for(
+                context,
+                specialization->getTemplateArgs().get(1),
+                element_type
+            )) {
+            return std::nullopt;
+        }
 
-        if (!start_offset || !finish_offset)
+        const auto start_location =
+            find_field_location(context, specialization, "_M_start");
+        const auto finish_location =
+            find_field_location(context, specialization, "_M_finish");
+
+        if (!start_location || !finish_location)
             return std::nullopt;
 
+        if (start_location->bit_offset % CHAR_BIT != 0 ||
+            finish_location->bit_offset % CHAR_BIT != 0 ||
+            !is_native_element_pointer(
+                context,
+                *start_location->field,
+                element_type
+            ) ||
+            !is_native_element_pointer(
+                context,
+                *finish_location->field,
+                element_type
+            ) ||
+            !context.hasSameType(
+                start_location->field->getType(),
+                finish_location->field->getType()
+            )) {
+            return std::nullopt;
+        }
+
         const std::uintptr_t start_address =
-            object + *start_offset / CHAR_BIT;
+            object + start_location->bit_offset / CHAR_BIT;
         const std::uintptr_t finish_address =
-            object + *finish_offset / CHAR_BIT;
+            object + finish_location->bit_offset / CHAR_BIT;
 
         if (!is_readable_memory(start_address, sizeof(std::uintptr_t)) ||
             !is_readable_memory(finish_address, sizeof(std::uintptr_t))) {
