@@ -64,7 +64,8 @@ tests/regression.sh
 输入颜色在 `LineEditor::readLine()` 外切换，没有把 ANSI escape 放进 prompt，
 因此不会干扰 LineEditor 的光标宽度计算。普通数值主体仍保持终端默认颜色，
 避免高密度输出过于杂乱。输出被重定向或通过管道传递时会自动关闭颜色，
-因此脚本、测试和日志仍是纯文本。
+因此脚本、测试和日志仍是纯文本。`TERM=dumb` 时也会关闭颜色；其他交互式
+终端不依赖 LLVM 内置的终端名称列表，因此 Alacritty 等新终端同样可用。
 
 遵循通用的 `NO_COLOR` 约定，可以显式禁用交互颜色：
 
