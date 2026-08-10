@@ -11,13 +11,16 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <bitset>
+#include <cctype>
 #include <climits>
 #include <cstddef>
 #include <iomanip>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -147,6 +150,7 @@ static std::string decimal_string(T value)
 
 template <typename T>
 static void print_integer(
+    llvm::raw_ostream& out,
     const clang::Value& value,
     T number
 )
@@ -161,23 +165,23 @@ static void print_integer(
     //
     // (int) 13
 
-    llvm::outs() << "(";
+    out << "(";
 
-    value.printType(llvm::outs());
+    value.printType(out);
 
-    llvm::outs()
+    out
         << ") "
         << decimal_string(number)
         << "\n";
 
     // 二进制
-    llvm::outs()
+    out
         << "bits : "
         << group_bits(binary)
         << "\n";
 
     // 十六进制，每个 digit 与上面的 nibble 对齐
-    llvm::outs()
+    out
         << "hex  : "
         << align_hex(hex)
         << "\n";
@@ -192,6 +196,7 @@ static void print_integer(
 // ============================================================
 
 static void print_value(
+    llvm::raw_ostream& out,
     const clang::Value& value
 )
 {
@@ -203,7 +208,7 @@ static void print_value(
     // Clang 默认会尽可能显示枚举名，
     // 比单纯显示底层整数更有用。
     if (value.getType()->isEnumeralType()) {
-        value.print(llvm::outs());
+        value.print(out);
         return;
     }
 
@@ -218,7 +223,7 @@ static void print_value(
     // --------------------------------------------------------
 
     case clang::Value::K_Bool:
-        value.print(llvm::outs());
+        value.print(out);
         return;
 
 
@@ -228,6 +233,7 @@ static void print_value(
 
     case clang::Value::K_Char_S:
         print_integer(
+            out,
             value,
             value.getChar_S()
         );
@@ -235,6 +241,7 @@ static void print_value(
 
     case clang::Value::K_SChar:
         print_integer(
+            out,
             value,
             value.getSChar()
         );
@@ -242,6 +249,7 @@ static void print_value(
 
     case clang::Value::K_Char_U:
         print_integer(
+            out,
             value,
             value.getChar_U()
         );
@@ -249,6 +257,7 @@ static void print_value(
 
     case clang::Value::K_UChar:
         print_integer(
+            out,
             value,
             value.getUChar()
         );
@@ -261,6 +270,7 @@ static void print_value(
 
     case clang::Value::K_Short:
         print_integer(
+            out,
             value,
             value.getShort()
         );
@@ -268,6 +278,7 @@ static void print_value(
 
     case clang::Value::K_UShort:
         print_integer(
+            out,
             value,
             value.getUShort()
         );
@@ -280,6 +291,7 @@ static void print_value(
 
     case clang::Value::K_Int:
         print_integer(
+            out,
             value,
             value.getInt()
         );
@@ -287,6 +299,7 @@ static void print_value(
 
     case clang::Value::K_UInt:
         print_integer(
+            out,
             value,
             value.getUInt()
         );
@@ -299,6 +312,7 @@ static void print_value(
 
     case clang::Value::K_Long:
         print_integer(
+            out,
             value,
             value.getLong()
         );
@@ -306,6 +320,7 @@ static void print_value(
 
     case clang::Value::K_ULong:
         print_integer(
+            out,
             value,
             value.getULong()
         );
@@ -318,6 +333,7 @@ static void print_value(
 
     case clang::Value::K_LongLong:
         print_integer(
+            out,
             value,
             value.getLongLong()
         );
@@ -325,6 +341,7 @@ static void print_value(
 
     case clang::Value::K_ULongLong:
         print_integer(
+            out,
             value,
             value.getULongLong()
         );
@@ -346,9 +363,141 @@ static void print_value(
     // --------------------------------------------------------
 
     default:
-        value.print(llvm::outs());
+        value.print(out);
         return;
     }
+}
+
+
+static std::string value_string(
+    const clang::Value& value
+)
+{
+    std::string result;
+    llvm::raw_string_ostream out(result);
+    print_value(out, value);
+    out.flush();
+    return result;
+}
+
+
+static void print_error(llvm::Error error);
+
+
+// ============================================================
+// 变量监视
+// ============================================================
+
+struct Watch {
+    std::string name;
+    std::string fingerprint;
+};
+
+
+struct CapturedValue {
+    clang::Value::Kind kind;
+    std::string fingerprint;
+    std::string rendered;
+};
+
+
+static bool is_identifier(
+    llvm::StringRef name
+)
+{
+    if (name.empty() ||
+        !(std::isalpha(static_cast<unsigned char>(name.front())) ||
+          name.front() == '_')) {
+        return false;
+    }
+
+    for (char ch : name.drop_front()) {
+        if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_'))
+            return false;
+    }
+
+    return true;
+}
+
+
+static llvm::Expected<CapturedValue> capture_expression(
+    clang::Interpreter& interpreter,
+    llvm::StringRef expression
+)
+{
+    std::optional<CapturedValue> captured;
+
+    {
+        clang::Value value;
+
+        if (auto error =
+                interpreter.ParseAndExecute(expression, &value)) {
+            return std::move(error);
+        }
+
+        if (!value.hasValue()) {
+            return llvm::createStringError(
+                std::errc::invalid_argument,
+                "expression has no value"
+            );
+        }
+
+        std::string type;
+        llvm::raw_string_ostream type_out(type);
+        value.printType(type_out);
+        type_out.flush();
+
+        std::string data;
+        llvm::raw_string_ostream data_out(data);
+        value.printData(data_out);
+        data_out.flush();
+
+        captured = CapturedValue{
+            value.getKind(),
+            type + "\n" + data,
+            value_string(value)
+        };
+    }
+
+    // The evaluation above is an implementation detail.  Remove its PTU so
+    // that a later %undo still targets the user's previous input.
+    if (auto error = interpreter.Undo())
+        return std::move(error);
+
+    return std::move(*captured);
+}
+
+
+static bool refresh_watches(
+    clang::Interpreter& interpreter,
+    std::vector<Watch>& watches
+)
+{
+    bool changed = false;
+
+    for (Watch& watch : watches) {
+        auto captured =
+            capture_expression(interpreter, watch.name);
+
+        if (!captured) {
+            llvm::errs() << "watch " << watch.name << ": ";
+            print_error(captured.takeError());
+            continue;
+        }
+
+        if (captured->fingerprint == watch.fingerprint)
+            continue;
+
+        watch.fingerprint = captured->fingerprint;
+        changed = true;
+
+        llvm::outs()
+            << watch.name
+            << ":\n"
+            << captured->rendered;
+    }
+
+    return changed;
 }
 
 
@@ -496,6 +645,7 @@ int main()
     editor.setPrompt("crepl> ");
 
     std::string input;
+    std::vector<Watch> watches;
 
 
     while (
@@ -552,6 +702,8 @@ int main()
 
             llvm::outs()
                 << "%help          show commands\n"
+                << "%watch [name...] watch scalar variables\n"
+                << "%unwatch [name...] stop watching variables\n"
                 << "%undo          undo previous input\n"
                 << "%lib <path>    load dynamic library\n"
                 << "%quit          exit\n";
@@ -559,6 +711,110 @@ int main()
             input.clear();
             editor.setPrompt("crepl> ");
 
+            continue;
+        }
+
+
+        if (
+            input == "%watch" ||
+            llvm::StringRef(input).starts_with("%watch ")
+        ) {
+            std::istringstream words(input);
+            std::string command;
+            std::string name;
+            words >> command;
+
+            if (!(words >> name)) {
+                if (watches.empty()) {
+                    llvm::outs() << "no watched variables\n";
+                }
+                else {
+                    for (const Watch& watch : watches)
+                        llvm::outs() << watch.name << "\n";
+                }
+            }
+            else {
+                do {
+                    if (!is_identifier(name)) {
+                        llvm::errs()
+                            << "error: invalid variable name: "
+                            << name
+                            << "\n";
+                        continue;
+                    }
+
+                    auto captured =
+                        capture_expression(*interpreter, name);
+
+                    if (!captured) {
+                        llvm::errs() << "watch " << name << ": ";
+                        print_error(captured.takeError());
+                        continue;
+                    }
+
+                    if (captured->kind == clang::Value::K_PtrOrObj) {
+                        llvm::errs()
+                            << "error: %watch currently supports scalar "
+                            << "variables only: "
+                            << name
+                            << "\n";
+                        continue;
+                    }
+
+                    auto existing = std::find_if(
+                        watches.begin(),
+                        watches.end(),
+                        [&](const Watch& watch) {
+                            return watch.name == name;
+                        }
+                    );
+
+                    if (existing == watches.end()) {
+                        watches.push_back(
+                            Watch{name, captured->fingerprint}
+                        );
+                        llvm::outs() << "watching " << name << "\n";
+                    }
+                    else {
+                        existing->fingerprint = captured->fingerprint;
+                    }
+                } while (words >> name);
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
+            continue;
+        }
+
+
+        if (
+            input == "%unwatch" ||
+            llvm::StringRef(input).starts_with("%unwatch ")
+        ) {
+            std::istringstream words(input);
+            std::string command;
+            std::string name;
+            words >> command;
+
+            if (!(words >> name)) {
+                watches.clear();
+                llvm::outs() << "cleared all watches\n";
+            }
+            else {
+                do {
+                    auto new_end = std::remove_if(
+                        watches.begin(),
+                        watches.end(),
+                        [&](const Watch& watch) {
+                            return watch.name == name;
+                        }
+                    );
+                    watches.erase(new_end, watches.end());
+                } while (words >> name);
+            }
+
+            input.clear();
+            editor.setPrompt("crepl> ");
             continue;
         }
 
@@ -572,6 +828,9 @@ int main()
                 print_error(
                     std::move(error)
                 );
+            }
+            else {
+                refresh_watches(*interpreter, watches);
             }
 
             input.clear();
@@ -626,6 +885,8 @@ int main()
         // ----------------------------------------------------
 
         clang::Value value;
+        std::optional<std::string> result_output;
+        bool execution_succeeded = false;
 
         if (
             auto error =
@@ -639,8 +900,19 @@ int main()
             );
         }
         else if (value.hasValue()) {
+            result_output = value_string(value);
+            execution_succeeded = true;
+        }
+        else {
+            execution_succeeded = true;
+        }
 
-            print_value(value);
+        if (execution_succeeded) {
+            const bool watched_changed =
+                refresh_watches(*interpreter, watches);
+
+            if (!watched_changed && result_output)
+                llvm::outs() << *result_output;
         }
 
 
