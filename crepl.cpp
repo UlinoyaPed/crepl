@@ -1118,6 +1118,115 @@ static bool is_identifier(
 }
 
 
+static void append_input_line(
+    std::string& input,
+    llvm::StringRef line,
+    bool add_newline = true
+)
+{
+    if (!input.empty() && add_newline)
+        input += '\n';
+    input += line.str();
+}
+
+
+static bool needs_more_input(
+    llvm::StringRef code
+)
+{
+    enum class LexState {
+        Normal,
+        String,
+        Character,
+        LineComment,
+        BlockComment
+    };
+
+    LexState state = LexState::Normal;
+    bool escaped = false;
+    int parentheses = 0;
+    int brackets = 0;
+    int braces = 0;
+
+    for (std::size_t index = 0; index < code.size(); ++index) {
+        const char ch = code[index];
+        const char next = index + 1 < code.size()
+            ? code[index + 1]
+            : '\0';
+
+        if (state == LexState::LineComment) {
+            if (ch == '\n')
+                state = LexState::Normal;
+            continue;
+        }
+
+        if (state == LexState::BlockComment) {
+            if (ch == '*' && next == '/') {
+                state = LexState::Normal;
+                ++index;
+            }
+            continue;
+        }
+
+        if (state == LexState::String || state == LexState::Character) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+
+            if ((state == LexState::String && ch == '"') ||
+                (state == LexState::Character && ch == '\'')) {
+                state = LexState::Normal;
+            }
+            continue;
+        }
+
+        if (ch == '/' && next == '/') {
+            state = LexState::LineComment;
+            ++index;
+        }
+        else if (ch == '/' && next == '*') {
+            state = LexState::BlockComment;
+            ++index;
+        }
+        else if (ch == '"') {
+            state = LexState::String;
+        }
+        else if (ch == '\'') {
+            state = LexState::Character;
+        }
+        else if (ch == '(') {
+            ++parentheses;
+        }
+        else if (ch == ')') {
+            parentheses = std::max(0, parentheses - 1);
+        }
+        else if (ch == '[') {
+            ++brackets;
+        }
+        else if (ch == ']') {
+            brackets = std::max(0, brackets - 1);
+        }
+        else if (ch == '{') {
+            ++braces;
+        }
+        else if (ch == '}') {
+            braces = std::max(0, braces - 1);
+        }
+    }
+
+    return parentheses > 0 || brackets > 0 || braces > 0 ||
+        state == LexState::String ||
+        state == LexState::Character ||
+        state == LexState::BlockComment;
+}
+
+
 static llvm::Expected<CapturedValue> capture_expression(
     clang::Interpreter& interpreter,
     llvm::StringRef expression
@@ -1982,6 +2091,7 @@ int main()
     editor.setPrompt("crepl> ");
 
     std::string input;
+    bool join_next_line = false;
     std::vector<Watch> watches;
 
 
@@ -2009,13 +2119,12 @@ int main()
         // ----------------------------------------------------
 
         if (current.ends_with("\\")) {
-
-            input +=
-                current.drop_back(1).str();
-
-            // 预处理指令换行有意义
-            if (current.starts_with("#"))
-                input += '\n';
+            append_input_line(
+                input,
+                current.drop_back(1),
+                !join_next_line
+            );
+            join_next_line = true;
 
             editor.setPrompt("crepl... ");
 
@@ -2023,7 +2132,13 @@ int main()
         }
 
 
-        input += current.str();
+        append_input_line(input, current, !join_next_line);
+        join_next_line = false;
+
+        if (needs_more_input(input)) {
+            editor.setPrompt("crepl... ");
+            continue;
+        }
 
 
         // ----------------------------------------------------
