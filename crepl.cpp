@@ -14,6 +14,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -40,6 +42,128 @@
 // ============================================================
 // 二进制 / 十六进制格式化
 // ============================================================
+
+static bool color_output = false;
+
+
+static bool can_color(
+    llvm::raw_ostream& out
+)
+{
+    return color_output && out.has_colors();
+}
+
+
+static void set_color(
+    llvm::raw_ostream& out,
+    llvm::raw_ostream::Colors color,
+    bool bold = false
+)
+{
+    if (can_color(out))
+        out.changeColor(color, bold);
+}
+
+
+static void reset_color(
+    llvm::raw_ostream& out
+)
+{
+    if (can_color(out))
+        out.resetColor();
+}
+
+
+static void print_label(
+    llvm::raw_ostream& out,
+    llvm::StringRef text
+)
+{
+    set_color(out, llvm::raw_ostream::BRIGHT_BLACK);
+    out << text;
+    reset_color(out);
+}
+
+
+static void print_heading(
+    llvm::raw_ostream& out,
+    llvm::StringRef text
+)
+{
+    set_color(out, llvm::raw_ostream::BRIGHT_CYAN, true);
+    out << text;
+    reset_color(out);
+}
+
+
+static void print_type_name(
+    llvm::raw_ostream& out,
+    llvm::StringRef text
+)
+{
+    set_color(out, llvm::raw_ostream::CYAN);
+    out << text;
+    reset_color(out);
+}
+
+
+static void print_help_line(
+    llvm::StringRef command,
+    llvm::StringRef description
+)
+{
+    llvm::raw_ostream& out = llvm::outs();
+    set_color(out, llvm::raw_ostream::BRIGHT_CYAN, true);
+    out << command;
+    reset_color(out);
+    out << std::string(
+        command.size() < 22 ? 22 - command.size() : 1,
+        ' '
+    );
+    print_label(out, description);
+    out << "\n";
+}
+
+
+static void print_colored_bits(
+    llvm::raw_ostream& out,
+    llvm::StringRef bits,
+    llvm::StringRef changed = {}
+)
+{
+    for (std::size_t index = 0; index < bits.size(); ++index) {
+        const char ch = bits[index];
+        const bool is_changed =
+            index < changed.size() && changed[index] == '^';
+
+        if (is_changed)
+            set_color(out, llvm::raw_ostream::BRIGHT_RED, true);
+        else if (ch == '1')
+            set_color(out, llvm::raw_ostream::BRIGHT_CYAN, true);
+        else if (ch == '0')
+            set_color(out, llvm::raw_ostream::BRIGHT_BLACK);
+
+        out << ch;
+        reset_color(out);
+    }
+}
+
+
+static void print_colored_hex(
+    llvm::raw_ostream& out,
+    llvm::StringRef hex
+)
+{
+    for (char ch : hex) {
+        if (ch == '0')
+            set_color(out, llvm::raw_ostream::BRIGHT_BLACK);
+        else if (std::isxdigit(static_cast<unsigned char>(ch)))
+            set_color(out, llvm::raw_ostream::BRIGHT_YELLOW, true);
+
+        out << ch;
+        reset_color(out);
+    }
+}
 
 template <typename T>
 static std::string binary_string(T value)
@@ -177,8 +301,9 @@ static void print_integer(
     // (int) 13
 
     out << "(";
-
+    set_color(out, llvm::raw_ostream::CYAN);
     value.printType(out);
+    reset_color(out);
 
     out
         << ") "
@@ -186,16 +311,14 @@ static void print_integer(
         << "\n";
 
     // 二进制
-    out
-        << "bits : "
-        << group_bits(binary)
-        << "\n";
+    print_label(out, "bits : ");
+    print_colored_bits(out, group_bits(binary));
+    out << "\n";
 
     // 十六进制，每个 digit 与上面的 nibble 对齐
-    out
-        << "hex  : "
-        << align_hex(hex)
-        << "\n";
+    print_label(out, "hex  : ");
+    print_colored_hex(out, align_hex(hex));
+    out << "\n";
 }
 
 
@@ -348,7 +471,9 @@ static bool print_array(
         return false;
 
     out << "(";
+    set_color(out, llvm::raw_ostream::CYAN);
     value.printType(out);
+    reset_color(out);
     out << ") ";
     print_array_data(
         out,
@@ -644,7 +769,9 @@ static bool print_sequence(
     }
 
     out << "(";
+    set_color(out, llvm::raw_ostream::CYAN);
     value.printType(out);
+    reset_color(out);
     out << ") [";
 
     for (std::size_t index = 0; index < sequence->count; ++index) {
@@ -697,11 +824,12 @@ static bool print_sequence_index(
         ));
     }
 
-    out << "index :";
+    print_label(out, "index :");
     for (std::size_t index = 0; index < sequence->count; ++index)
         out << " " << centered(indexes[index], widths[index]);
 
-    out << "\nvalue :";
+    out << "\n";
+    print_label(out, "value :");
     for (std::size_t index = 0; index < sequence->count; ++index)
         out << " " << centered(values[index], widths[index]);
 
@@ -718,6 +846,20 @@ static std::uint64_t load_integer_bits(
     std::uint64_t raw = 0;
     std::memcpy(&raw, data, size);
     return raw;
+}
+
+
+static void print_arrow_type(
+    llvm::raw_ostream& out,
+    llvm::StringRef indent,
+    llvm::StringRef type_name
+)
+{
+    out << indent;
+    print_heading(out, "->");
+    out << " (";
+    print_type_name(out, type_name);
+    out << ") ";
 }
 
 
@@ -740,7 +882,12 @@ static void print_pointer_target(
             address,
             static_cast<std::size_t>(size->getQuantity())
         )) {
-        out << indent << "-> <unreadable>\n";
+        out << indent;
+        print_heading(out, "->");
+        set_color(out, llvm::raw_ostream::BRIGHT_RED, true);
+        out << " <unreadable>";
+        reset_color(out);
+        out << "\n";
         return;
     }
 
@@ -750,7 +897,7 @@ static void print_pointer_target(
         type.getAsString(context.getPrintingPolicy());
 
     if (const auto* array = context.getAsConstantArrayType(type)) {
-        out << indent << "-> (" << type_name << ") ";
+        print_arrow_type(out, indent, type_name);
         print_array_data(out, context, *array, data);
         out << "\n";
         return;
@@ -758,7 +905,7 @@ static void print_pointer_target(
 
     if (type->isIntegerType() &&
         size->getQuantity() <= static_cast<std::int64_t>(sizeof(std::uint64_t))) {
-        out << indent << "-> (" << type_name << ") ";
+        print_arrow_type(out, indent, type_name);
         print_array_integer(
             out,
             type,
@@ -784,14 +931,19 @@ static void print_pointer_target(
                 << std::setw(static_cast<int>((width + 3) / 4))
                 << raw;
 
-            out << indent << "   bits : " << group_bits(bits) << "\n"
-                << indent << "   hex  : " << align_hex(hex.str()) << "\n";
+            out << indent << "   ";
+            print_label(out, "bits : ");
+            print_colored_bits(out, group_bits(bits));
+            out << "\n" << indent << "   ";
+            print_label(out, "hex  : ");
+            print_colored_hex(out, align_hex(hex.str()));
+            out << "\n";
         }
         return;
     }
 
     if (type->isRealFloatingType()) {
-        out << indent << "-> (" << type_name << ") ";
+        print_arrow_type(out, indent, type_name);
         print_array_element(out, context, type, data);
         out << "\n";
         return;
@@ -800,7 +952,7 @@ static void print_pointer_target(
     if (type->isPointerType()) {
         std::uintptr_t next = 0;
         std::memcpy(&next, data, sizeof(next));
-        out << indent << "-> (" << type_name << ") ";
+        print_arrow_type(out, indent, type_name);
 
         if (next == 0) {
             out << "nullptr\n";
@@ -819,12 +971,11 @@ static void print_pointer_target(
         return;
     }
 
-    out << indent
-        << "-> ("
-        << type_name
-        << ") @0x"
-        << llvm::utohexstr(address)
-        << "\n";
+    print_arrow_type(out, indent, type_name);
+    set_color(out, llvm::raw_ostream::BRIGHT_MAGENTA);
+    out << "@0x" << llvm::utohexstr(address);
+    reset_color(out);
+    out << "\n";
 }
 
 
@@ -838,7 +989,15 @@ static bool print_pointer(
     if (!type->isPointerType())
         return false;
 
-    value.print(out);
+    out << "(";
+    set_color(out, llvm::raw_ostream::CYAN);
+    value.printType(out);
+    reset_color(out);
+    out << ") ";
+    set_color(out, llvm::raw_ostream::BRIGHT_MAGENTA);
+    value.printData(out);
+    reset_color(out);
+    out << "\n";
 
     const std::uintptr_t address =
         reinterpret_cast<std::uintptr_t>(value.getPtr());
@@ -855,6 +1014,21 @@ static bool print_pointer(
     }
 
     return true;
+}
+
+
+static void print_default_value(
+    llvm::raw_ostream& out,
+    const clang::Value& value
+)
+{
+    out << "(";
+    set_color(out, llvm::raw_ostream::CYAN);
+    value.printType(out);
+    reset_color(out);
+    out << ") ";
+    value.printData(out);
+    out << "\n";
 }
 
 static void print_value(
@@ -879,7 +1053,7 @@ static void print_value(
     // Clang 默认会尽可能显示枚举名，
     // 比单纯显示底层整数更有用。
     if (value.getType()->isEnumeralType()) {
-        value.print(out);
+        print_default_value(out, value);
         return;
     }
 
@@ -894,7 +1068,7 @@ static void print_value(
     // --------------------------------------------------------
 
     case clang::Value::K_Bool:
-        value.print(out);
+        print_default_value(out, value);
         return;
 
 
@@ -1034,7 +1208,7 @@ static void print_value(
     // --------------------------------------------------------
 
     default:
-        value.print(out);
+        print_default_value(out, value);
         return;
     }
 }
@@ -1576,39 +1750,51 @@ static void print_detailed_bits(
         columns.push_back(std::max<std::size_t>(4, label.size()));
     }
 
-    llvm::outs() << "type : " << value.type << "\nbit  : ";
+    llvm::raw_ostream& out = llvm::outs();
+    print_label(out, "type : ");
+    print_type_name(out, value.type);
+    out << "\n";
+    print_label(out, "bit  : ");
 
     for (unsigned index = 0; index < nibbles; ++index) {
         if (index != 0)
-            llvm::outs() << " ";
-        llvm::outs() << centered(labels[index], columns[index]);
+            out << " ";
+        print_label(out, centered(labels[index], columns[index]));
     }
 
-    llvm::outs() << "\nbits : ";
+    out << "\n";
+    print_label(out, "bits : ");
 
     for (unsigned index = 0; index < nibbles; ++index) {
         if (index != 0)
-            llvm::outs() << " ";
-        llvm::outs() << centered(
-            llvm::StringRef(bits).substr(index * 4, 4),
-            columns[index]
+            out << " ";
+        print_colored_bits(
+            out,
+            centered(
+                llvm::StringRef(bits).substr(index * 4, 4),
+                columns[index]
+            )
         );
     }
 
-    llvm::outs() << "\nhex  : ";
+    out << "\n";
+    print_label(out, "hex  : ");
     const std::string hex = hex_string(value.raw)
         .substr(16 - nibbles);
 
     for (unsigned index = 0; index < nibbles; ++index) {
         if (index != 0)
-            llvm::outs() << " ";
-        llvm::outs() << centered(
-            llvm::StringRef(hex).substr(index, 1),
-            columns[index]
+            out << " ";
+        print_colored_hex(
+            out,
+            centered(
+                llvm::StringRef(hex).substr(index, 1),
+                columns[index]
+            )
         );
     }
 
-    llvm::outs() << "\n";
+    out << "\n";
 }
 
 
@@ -1630,10 +1816,18 @@ static void print_integer_diff(
         difference += old_bits[index] == new_bits[index] ? ' ' : '^';
     }
 
-    llvm::outs()
-        << "old  : " << group_bits(old_bits) << "\n"
-        << "new  : " << group_bits(new_bits) << "\n"
-        << "diff : " << difference << "\n";
+    llvm::raw_ostream& out = llvm::outs();
+    print_label(out, "old  : ");
+    print_colored_bits(out, group_bits(old_bits), difference);
+    out << "\n";
+    print_label(out, "new  : ");
+    print_colored_bits(out, group_bits(new_bits), difference);
+    out << "\n";
+    print_label(out, "diff : ");
+    set_color(out, llvm::raw_ostream::BRIGHT_RED, true);
+    out << difference;
+    reset_color(out);
+    out << "\n";
 }
 
 
@@ -1669,15 +1863,21 @@ static void print_type_info(
     const TypeInfo& info
 )
 {
-    llvm::outs() << "type     : " << info.type << "\n";
+    llvm::raw_ostream& out = llvm::outs();
+    print_label(out, "type     : ");
+    print_type_name(out, info.type);
+    out << "\n";
 
+    print_label(out, "size     : ");
     if (info.size)
-        llvm::outs() << "size     : " << *info.size << " bytes\n";
+        out << *info.size << " bytes\n";
     else
-        llvm::outs() << "size     : incomplete\n";
+        out << "incomplete\n";
 
-    if (info.alignment)
-        llvm::outs() << "align    : " << *info.alignment << " bytes\n";
+    if (info.alignment) {
+        print_label(out, "align    : ");
+        out << *info.alignment << " bytes\n";
+    }
 
     if (info.is_integer) {
         const std::string minimum = info.is_boolean
@@ -1687,15 +1887,14 @@ static void print_type_info(
             ? "1"
             : integer_limit(info.is_signed, false, info.width);
 
-        llvm::outs()
-            << "bits     : " << info.width << "\n"
-            << "signed   : " << (info.is_signed ? "yes" : "no") << "\n"
-            << "min      : "
-            << minimum
-            << "\n"
-            << "max      : "
-            << maximum
-            << "\n";
+        print_label(out, "bits     : ");
+        out << info.width << "\n";
+        print_label(out, "signed   : ");
+        out << (info.is_signed ? "yes" : "no") << "\n";
+        print_label(out, "min      : ");
+        out << minimum << "\n";
+        print_label(out, "max      : ");
+        out << maximum << "\n";
     }
 }
 
@@ -1764,12 +1963,18 @@ static void print_layout(
         ? "union"
         : record.isClass() ? "class" : "struct";
 
-    llvm::outs()
-        << tag << " " << record.getName()
-        << "    size=" << size
-        << " align=" << alignment
-        << "\n\n"
-        << "offset  member\n";
+    llvm::raw_ostream& out = llvm::outs();
+    print_heading(
+        out,
+        std::string(tag) + " " + record.getName().str()
+    );
+    out << "    ";
+    print_label(out, "size=");
+    out << size << " ";
+    print_label(out, "align=");
+    out << alignment << "\n\n";
+    print_label(out, "offset  member");
+    out << "\n";
 
     std::uint64_t cursor_bits = 0;
 
@@ -1786,34 +1991,36 @@ static void print_layout(
             offset_bits % CHAR_BIT == 0) {
             const std::uint64_t padding =
                 (offset_bits - cursor_bits) / CHAR_BIT;
-            llvm::outs()
-                << cursor_bits / CHAR_BIT
+            out << cursor_bits / CHAR_BIT
                 << std::string(
                        cursor_bits / CHAR_BIT < 10 ? 7 : 6,
                        ' '
                    )
-                << "padding    "
-                << byte_count(padding)
-                << "\n";
+                ;
+            set_color(out, llvm::raw_ostream::BRIGHT_YELLOW);
+            out << "padding    " << byte_count(padding);
+            reset_color(out);
+            out << "\n";
         }
 
-        llvm::outs()
-            << offset_bits / CHAR_BIT;
+        out << offset_bits / CHAR_BIT;
 
         if (field->isBitField())
-            llvm::outs() << "." << offset_bits % CHAR_BIT;
+            out << "." << offset_bits % CHAR_BIT;
 
-        llvm::outs()
-            << std::string(offset_bits / CHAR_BIT < 10 ? 7 : 6, ' ')
-            << field->getType().getAsString(context.getPrintingPolicy())
-            << " "
+        out << std::string(offset_bits / CHAR_BIT < 10 ? 7 : 6, ' ');
+        print_type_name(
+            out,
+            field->getType().getAsString(context.getPrintingPolicy())
+        );
+        out << " "
             << (field->getName().empty() ? "<unnamed>" : field->getName())
             << "    ";
 
         if (field->isBitField())
-            llvm::outs() << field_bits << " bits\n";
+            out << field_bits << " bits\n";
         else
-            llvm::outs() << byte_count(field_bits / CHAR_BIT) << "\n";
+            out << byte_count(field_bits / CHAR_BIT) << "\n";
 
         if (!record.isUnion())
             cursor_bits = std::max(cursor_bits, offset_bits + field_bits);
@@ -1824,12 +2031,14 @@ static void print_layout(
     if (!record.isUnion() &&
         total_bits > cursor_bits &&
         cursor_bits % CHAR_BIT == 0) {
-        llvm::outs()
-            << cursor_bits / CHAR_BIT
+        out << cursor_bits / CHAR_BIT
             << std::string(cursor_bits / CHAR_BIT < 10 ? 7 : 6, ' ')
-            << "padding    "
-            << byte_count((total_bits - cursor_bits) / CHAR_BIT)
-            << "\n";
+            ;
+        set_color(out, llvm::raw_ostream::BRIGHT_YELLOW);
+        out << "padding    "
+            << byte_count((total_bits - cursor_bits) / CHAR_BIT);
+        reset_color(out);
+        out << "\n";
     }
 }
 
@@ -1877,19 +2086,23 @@ static void print_memory(
     const MemoryRegion& region
 )
 {
-    llvm::outs()
-        << "address : 0x"
-        << llvm::utohexstr(region.address)
-        << "\n"
-        << "type    : "
-        << region.type
-        << "\n"
-        << "size    : "
-        << region.size
+    llvm::raw_ostream& out = llvm::outs();
+    print_label(out, "address : ");
+    set_color(out, llvm::raw_ostream::BRIGHT_MAGENTA);
+    out << "0x" << llvm::utohexstr(region.address);
+    reset_color(out);
+    out << "\n";
+    print_label(out, "type    : ");
+    print_type_name(out, region.type);
+    out << "\n";
+    print_label(out, "size    : ");
+    out << region.size
         << (region.size == 1 ? " byte\n" : " bytes\n")
-        << "\n"
-        << "memory:\n"
-        << "offset   hex   bits\n";
+        << "\n";
+    print_heading(out, "memory:");
+    out << "\n";
+    print_label(out, "offset   hex   bits");
+    out << "\n";
 
     const auto* bytes =
         reinterpret_cast<const unsigned char*>(region.address);
@@ -1903,26 +2116,30 @@ static void print_memory(
             << std::setw(2)
             << static_cast<unsigned>(byte);
 
-        llvm::outs()
-            << "+"
-            << offset
+        print_label(out, "+");
+        print_label(out, std::to_string(offset));
+        out
             << std::string(
                    offset < 10 ? 7 : offset < 100 ? 6 : 5,
                    ' '
                )
-            << hex.str()
-            << "    "
-            << group_bits(binary_string(byte))
-            << "\n";
+            ;
+        print_colored_hex(out, hex.str());
+        out << "    ";
+        print_colored_bits(out, group_bits(binary_string(byte)));
+        out << "\n";
     }
 
     const std::uint16_t one = 1;
     const bool little_endian =
         *reinterpret_cast<const unsigned char*>(&one) == 1;
 
-    llvm::outs()
-        << "\n"
-        << (little_endian ? "little endian\n" : "big endian\n");
+    out << "\n";
+    print_label(
+        out,
+        little_endian ? "little endian" : "big endian"
+    );
+    out << "\n";
 }
 
 
@@ -1949,10 +2166,8 @@ static bool refresh_watches(
         watch.fingerprint = captured->fingerprint;
         changed = true;
 
-        llvm::outs()
-            << watch.name
-            << ":\n"
-            << captured->rendered;
+        print_heading(llvm::outs(), watch.name);
+        llvm::outs() << ":\n" << captured->rendered;
     }
 
     return changed;
@@ -2012,15 +2227,13 @@ static void print_state(
 )
 {
     if (snapshot.values.empty()) {
-        llvm::outs() << "no watched state\n";
+        print_label(llvm::outs(), "no watched state\n");
         return;
     }
 
     for (const auto& entry : snapshot.values) {
-        llvm::outs()
-            << entry.first
-            << ":\n"
-            << entry.second.rendered;
+        print_heading(llvm::outs(), entry.first);
+        llvm::outs() << ":\n" << entry.second.rendered;
     }
 }
 
@@ -2051,35 +2264,36 @@ static void print_snapshot_diff(
         }
 
         changed = true;
-        llvm::outs() << name << ":\n";
+        print_heading(llvm::outs(), name);
+        llvm::outs() << ":\n";
 
         if (old_value == before.values.end()) {
-            llvm::outs()
-                << "before: <not watched>\n"
-                << "after:\n"
-                << new_value->second.rendered;
+            print_label(llvm::outs(), "before: ");
+            llvm::outs() << "<not watched>\n";
+            print_label(llvm::outs(), "after:\n");
+            llvm::outs() << new_value->second.rendered;
             continue;
         }
 
         if (new_value == after.values.end()) {
-            llvm::outs()
-                << "before:\n"
-                << old_value->second.rendered
-                << "after: <not watched>\n";
+            print_label(llvm::outs(), "before:\n");
+            llvm::outs() << old_value->second.rendered;
+            print_label(llvm::outs(), "after: ");
+            llvm::outs() << "<not watched>\n";
             continue;
         }
 
-        llvm::outs()
-            << "before:\n"
-            << old_value->second.rendered
-            << "after:\n"
-            << new_value->second.rendered;
+        print_label(llvm::outs(), "before:\n");
+        llvm::outs() << old_value->second.rendered;
+        print_label(llvm::outs(), "after:\n");
+        llvm::outs() << new_value->second.rendered;
 
         if (old_value->second.integer &&
             new_value->second.integer &&
             old_value->second.integer->width ==
                 new_value->second.integer->width) {
-            llvm::outs() << "changed bits:\n";
+            print_heading(llvm::outs(), "changed bits:");
+            llvm::outs() << "\n";
             print_integer_diff(
                 *old_value->second.integer,
                 *new_value->second.integer
@@ -2088,7 +2302,7 @@ static void print_snapshot_diff(
     }
 
     if (!changed)
-        llvm::outs() << "no changes\n";
+        print_label(llvm::outs(), "no changes\n");
 }
 
 
@@ -2100,6 +2314,21 @@ static void print_error(
     llvm::Error error
 )
 {
+    if (can_color(llvm::errs())) {
+        set_color(
+            llvm::errs(),
+            llvm::raw_ostream::BRIGHT_RED,
+            true
+        );
+        llvm::errs() << "error: ";
+        reset_color(llvm::errs());
+        llvm::logAllUnhandledErrors(
+            std::move(error),
+            llvm::errs()
+        );
+        return;
+    }
+
     llvm::logAllUnhandledErrors(
         std::move(error),
         llvm::errs(),
@@ -2114,6 +2343,12 @@ static void print_error(
 
 int main()
 {
+    color_output =
+        std::getenv("NO_COLOR") == nullptr &&
+        llvm::outs().has_colors();
+    llvm::outs().enable_colors(color_output);
+    llvm::errs().enable_colors(color_output);
+
     // --------------------------------------------------------
     // 初始化 LLVM JIT 所需 target。
     //
@@ -2299,25 +2534,23 @@ int main()
 
 
         if (input == "%help") {
-
-            llvm::outs()
-                << "%help          show commands\n"
-                << "%watch [name...] watch scalars and C arrays\n"
-                << "%unwatch [name...] stop watching variables\n"
-                << "%mem <name> [bytes] inspect object or pointer memory\n"
-                << "%bits <expr>  show an indexed integer bit view\n"
-                << "%diff <old> <new-expr> compare integer bit patterns\n"
-                << "%type <expr>  show type and integer limits\n"
-                << "%index <expr> show sequence indexes and values\n"
-                << "%sizeof <arg> show sizeof(type-or-expression)\n"
-                << "%alignof <type> show a type's alignment\n"
-                << "%layout <type> show record fields and padding\n"
-                << "%state         show all watched values\n"
-                << "%snapshot <name> save watched state\n"
-                << "%history [count] show successful C++ inputs\n"
-                << "%undo          undo previous input\n"
-                << "%lib <path>    load dynamic library\n"
-                << "%quit          exit\n";
+            print_help_line("%help", "show commands");
+            print_help_line("%watch [name...]", "watch variables");
+            print_help_line("%unwatch [name...]", "stop watching variables");
+            print_help_line("%mem <name> [bytes]", "inspect memory");
+            print_help_line("%bits <expr>", "show indexed integer bits");
+            print_help_line("%diff <old> <new>", "compare bits or snapshots");
+            print_help_line("%type <expr>", "show type and integer limits");
+            print_help_line("%index <expr>", "show sequence indexes");
+            print_help_line("%sizeof <arg>", "show object size");
+            print_help_line("%alignof <type>", "show type alignment");
+            print_help_line("%layout <type>", "show record layout");
+            print_help_line("%state", "show watched values");
+            print_help_line("%snapshot <name>", "save watched state");
+            print_help_line("%history [count]", "show successful inputs");
+            print_help_line("%undo", "undo previous user input");
+            print_help_line("%lib <path>", "load dynamic library");
+            print_help_line("%quit", "exit");
 
             input.clear();
             editor.setPrompt("crepl> ");
@@ -2365,7 +2598,9 @@ int main()
                 }
                 else {
                     snapshots[name.str()] = std::move(*snapshot);
-                    llvm::outs() << "saved snapshot " << name << "\n";
+                    print_label(llvm::outs(), "saved snapshot ");
+                    print_heading(llvm::outs(), name);
+                    llvm::outs() << "\n";
                 }
             }
 
@@ -2514,7 +2749,8 @@ int main()
                 if (!size)
                     print_error(size.takeError());
                 else
-                    llvm::outs() << "size : " << size->raw << " bytes\n";
+                    print_label(llvm::outs(), "size : ");
+                    llvm::outs() << size->raw << " bytes\n";
             }
 
             input.clear();
@@ -2543,10 +2779,8 @@ int main()
                 if (!alignment)
                     print_error(alignment.takeError());
                 else
-                    llvm::outs()
-                        << "alignment : "
-                        << alignment->raw
-                        << " bytes\n";
+                    print_label(llvm::outs(), "alignment : ");
+                    llvm::outs() << alignment->raw << " bytes\n";
             }
 
             input.clear();
@@ -2652,7 +2886,7 @@ int main()
 
             if (!(words >> name)) {
                 if (watches.empty()) {
-                    llvm::outs() << "no watched variables\n";
+                    print_label(llvm::outs(), "no watched variables\n");
                 }
                 else {
                     for (const Watch& watch : watches)
@@ -2702,7 +2936,9 @@ int main()
                         watches.push_back(
                             Watch{name, captured->fingerprint}
                         );
-                        llvm::outs() << "watching " << name << "\n";
+                        print_label(llvm::outs(), "watching ");
+                        print_heading(llvm::outs(), name);
+                        llvm::outs() << "\n";
                     }
                     else {
                         existing->fingerprint = captured->fingerprint;
@@ -2727,7 +2963,7 @@ int main()
 
             if (!(words >> name)) {
                 watches.clear();
-                llvm::outs() << "cleared all watches\n";
+                print_label(llvm::outs(), "cleared all watches\n");
             }
             else {
                 do {
@@ -2918,7 +3154,7 @@ int main()
                 refresh_watches(*interpreter, watches);
 
             if (!watched_changed && result_output)
-                llvm::outs() << *result_output;
+                print_value(llvm::outs(), value);
         }
 
 
