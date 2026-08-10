@@ -355,6 +355,7 @@ static void print_integer(
 // ============================================================
 
 static constexpr std::size_t sequence_display_limit = 256;
+static constexpr std::size_t memory_display_limit = 65536;
 
 
 static std::uint64_t load_integer_bits(
@@ -1988,11 +1989,18 @@ static llvm::Expected<MemoryRegion> capture_memory_region(
             }
 
             if (!validation_error) {
-                region = MemoryRegion{
-                    address,
-                    size,
-                    type.getAsString(context.getPrintingPolicy())
-                };
+                if (size == 0 || size > memory_display_limit) {
+                    validation_error =
+                        "byte count must be between 1 and " +
+                        std::to_string(memory_display_limit);
+                }
+                else {
+                    region = MemoryRegion{
+                        address,
+                        size,
+                        type.getAsString(context.getPrintingPolicy())
+                    };
+                }
             }
         }
     }
@@ -3509,10 +3517,11 @@ int main()
                             parsed_size
                         ) ||
                         parsed_size == 0 ||
-                        parsed_size > 65536) {
+                        parsed_size > memory_display_limit) {
                         llvm::errs()
                             << "error: byte count must be between 1 and "
-                            << "65536\n";
+                            << memory_display_limit
+                            << "\n";
                     }
                     else {
                         requested_size =

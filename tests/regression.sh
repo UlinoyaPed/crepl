@@ -81,6 +81,10 @@ contains "$cube_output" '... <15 more>' 'multidimensional arrays must share one 
 cube_changes=$(grep -c '^cube:$' <<<"$cube_output" || true)
 [[ $cube_changes -eq 1 ]] || fail 'bounded multidimensional arrays must remain watchable'
 
+memory_limit_output=$(run_crepl $'char big[65537] = {};\n%mem big\n%quit\n')
+contains "$memory_limit_output" 'byte count must be between 1 and 65536' 'default %mem object sizes must respect the display limit'
+[[ $memory_limit_output != *'address :'* ]] || fail 'oversized default %mem requests must not read or render memory'
+
 state_output=$(run_crepl $'int n = 1;\n%watch n\n%snapshot before\nn = 2;\n%snapshot after\n%undo\n%state\n%diff before after\n%quit\n')
 contains "$state_output" 'saved snapshot before' 'the before snapshot must be retained'
 contains "$state_output" 'saved snapshot after' 'the after snapshot must be retained'
