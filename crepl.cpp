@@ -331,6 +331,29 @@ static void print_integer(
 
 static constexpr std::size_t sequence_display_limit = 256;
 
+
+static std::uint64_t load_integer_bits(
+    const unsigned char* data,
+    std::size_t size
+)
+{
+    const std::uint16_t one = 1;
+    const bool little_endian =
+        *reinterpret_cast<const unsigned char*>(&one) == 1;
+    std::uint64_t raw = 0;
+
+    if (little_endian) {
+        for (std::size_t index = 0; index < size; ++index)
+            raw |= std::uint64_t{data[index]} << (index * CHAR_BIT);
+    }
+    else {
+        for (std::size_t index = 0; index < size; ++index)
+            raw = (raw << CHAR_BIT) | data[index];
+    }
+
+    return raw;
+}
+
 static void print_array_element(
     llvm::raw_ostream& out,
     const clang::ASTContext& context,
@@ -389,8 +412,7 @@ static void print_array_integer(
     std::size_t size
 )
 {
-    std::uint64_t raw = 0;
-    std::memcpy(&raw, data, size);
+    const std::uint64_t raw = load_integer_bits(data, size);
 
     if (type->isBooleanType()) {
         out << (raw == 0 ? "false" : "true");
@@ -948,17 +970,6 @@ static bool print_sequence_index(
 
     out << "\n";
     return true;
-}
-
-
-static std::uint64_t load_integer_bits(
-    const unsigned char* data,
-    std::size_t size
-)
-{
-    std::uint64_t raw = 0;
-    std::memcpy(&raw, data, size);
-    return raw;
 }
 
 
