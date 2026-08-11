@@ -4,6 +4,7 @@
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Type.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "clang/Interpreter/CodeCompletion.h"
 #include "clang/Interpreter/Interpreter.h"
 #include "clang/Interpreter/Value.h"
 #include "clang/Options/OptionUtils.h"
@@ -12,7 +13,6 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallString.h"
-#include "llvm/LineEditor/LineEditor.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/TargetSelect.h"
@@ -21,24 +21,30 @@
 
 #include <algorithm>
 #include <bitset>
+#include <chrono>
 #include <cctype>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include <histedit.h>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -84,24 +90,252 @@ static void reset_color(
 }
 
 
-static std::optional<std::string> read_input_line(
-    llvm::LineEditor& editor
-)
-{
-    llvm::raw_ostream& out = llvm::outs();
+struct CompletionResult {
+    std::string prefix;
+    std::vector<std::string> candidates;
+};
 
-    // Keep escape sequences outside LineEditor::Prompt.  libedit can then
-    // calculate the cursor position from the visible prompt width, while the
-    // terminal color remains active for both the prompt and edited input.
-    set_color(out, llvm::raw_ostream::BRIGHT_GREEN, true);
-    out.flush();
 
-    std::optional<std::string> line = editor.readLine();
+class Terminal {
+public:
+    using Completer = std::function<CompletionResult(
+        llvm::StringRef,
+        unsigned,
+        unsigned
+    )>;
 
-    reset_color(out);
-    out.flush();
-    return line;
-}
+    Terminal()
+        : edit_(el_init("crepl", stdin, stdout, stderr)),
+          history_(history_init())
+    {
+        if (!edit_ || !history_)
+            throw std::runtime_error("could not initialize libedit");
+
+        el_set(edit_, EL_CLIENTDATA, this);
+        el_set(edit_, EL_EDITOR, "emacs");
+        el_set(edit_, EL_SIGNAL, 0);
+        el_set(edit_, EL_PROMPT_ESC, &Terminal::prompt_callback, '\1');
+        el_set(edit_, EL_HIST, history, history_);
+        history(history_, &history_event_, H_SETSIZE, 10000);
+
+        el_set(edit_, EL_ADDFN, "crepl-cancel", "clear current input",
+               &Terminal::cancel_callback);
+        el_set(edit_, EL_ADDFN, "crepl-complete", "complete C++ name",
+               &Terminal::complete_callback);
+        el_set(edit_, EL_BIND, "^C", "crepl-cancel", nullptr);
+        el_set(edit_, EL_BIND, "^I", "crepl-complete", nullptr);
+        el_set(edit_, EL_BIND, "^P", "ed-prev-history", nullptr);
+        el_set(edit_, EL_BIND, "^N", "ed-next-history", nullptr);
+        el_set(edit_, EL_BIND, "^R", "em-inc-search-prev", nullptr);
+        el_set(edit_, EL_BIND, "^L", "ed-clear-screen", nullptr);
+
+        history_path_ = persistent_history_path();
+        if (!history_path_.empty()) {
+            std::error_code error;
+            std::filesystem::create_directories(
+                history_path_.parent_path(), error
+            );
+            history(history_, &history_event_, H_LOAD,
+                    history_path_.c_str());
+        }
+    }
+
+    ~Terminal()
+    {
+        save_history();
+        if (history_)
+            history_end(history_);
+        if (edit_)
+            el_end(edit_);
+    }
+
+    Terminal(const Terminal&) = delete;
+    Terminal& operator=(const Terminal&) = delete;
+
+    void set_execution(unsigned execution)
+    {
+        execution_ = execution;
+    }
+
+    void set_continuation(bool continuation)
+    {
+        continuation_ = continuation;
+    }
+
+    void set_completed_input_lines(unsigned count)
+    {
+        completed_input_lines_ = count;
+    }
+
+    void set_cancel_handler(std::function<void()> handler)
+    {
+        cancel_handler_ = std::move(handler);
+    }
+
+    void set_completer(Completer completer)
+    {
+        completer_ = std::move(completer);
+    }
+
+    std::optional<std::string> read_line()
+    {
+        int count = 0;
+        const char* line = el_gets(edit_, &count);
+        if (colors_enabled()) {
+            std::fputs("\033[0m", stdout);
+            std::fflush(stdout);
+        }
+
+        if (!line)
+            return std::nullopt;
+
+        std::string result(line, static_cast<std::size_t>(count));
+        while (!result.empty() &&
+               (result.back() == '\n' || result.back() == '\r')) {
+            result.pop_back();
+        }
+        return result;
+    }
+
+    void add_history(llvm::StringRef input)
+    {
+        if (input.empty())
+            return;
+        history(history_, &history_event_, H_ENTER, input.str().c_str());
+        save_history();
+    }
+
+private:
+    static Terminal* self(EditLine* edit)
+    {
+        Terminal* terminal = nullptr;
+        el_get(edit, EL_CLIENTDATA, &terminal);
+        return terminal;
+    }
+
+    static char* prompt_callback(EditLine* edit)
+    {
+        Terminal* terminal = self(edit);
+        if (terminal->continuation_) {
+            terminal->prompt_ = terminal->colors_enabled()
+                ? "\1\033[1;92m\1. \1\033[0;92m\1"
+                : ". ";
+        }
+        else {
+            std::ostringstream prompt;
+            if (terminal->colors_enabled()) {
+                prompt << "\1\033[1;92m\1crepl \1\033[1;96m\1["
+                       << terminal->execution_
+                       << "]\1\033[0m\1\n"
+                       << "\1\033[1;92m\1> \1\033[0;92m\1";
+            }
+            else {
+                prompt << "crepl [" << terminal->execution_ << "]\n> ";
+            }
+            terminal->prompt_ = prompt.str();
+        }
+        return terminal->prompt_.data();
+    }
+
+    static unsigned char cancel_callback(EditLine* edit, int)
+    {
+        Terminal* terminal = self(edit);
+        el_replacestr(edit, "");
+
+        if (terminal->cancel_handler_)
+            terminal->cancel_handler_();
+
+        // Move back over the header and every already accepted continuation
+        // line, clear that editing region, then let libedit redraw the same
+        // execution prompt.  No newline or ^C is emitted.
+        const unsigned lines_up = terminal->completed_input_lines_ + 1;
+        std::fputs("\r\033[2K", stdout);
+        if (lines_up != 0)
+            std::fprintf(stdout, "\033[%uA\r", lines_up);
+        std::fputs("\033[J", stdout);
+        std::fflush(stdout);
+
+        terminal->continuation_ = false;
+        terminal->completed_input_lines_ = 0;
+        return CC_REDISPLAY;
+    }
+
+    static unsigned char complete_callback(EditLine* edit, int)
+    {
+        Terminal* terminal = self(edit);
+        if (!terminal->completer_)
+            return CC_REFRESH_BEEP;
+
+        const LineInfo* info = el_line(edit);
+        const std::string line(info->buffer, info->lastchar);
+        const unsigned column = static_cast<unsigned>(
+            info->cursor - info->buffer
+        );
+        CompletionResult completion = terminal->completer_(
+            line,
+            terminal->completed_input_lines_ + 1,
+            column
+        );
+        if (completion.candidates.empty())
+            return CC_REFRESH_BEEP;
+
+        std::string common = completion.candidates.front();
+        for (const std::string& candidate : completion.candidates) {
+            std::size_t length = 0;
+            while (length < common.size() && length < candidate.size() &&
+                   common[length] == candidate[length]) {
+                ++length;
+            }
+            common.resize(length);
+        }
+
+        if (common.size() > completion.prefix.size()) {
+            const std::string suffix = common.substr(completion.prefix.size());
+            el_insertstr(edit, suffix.c_str());
+            return CC_REFRESH;
+        }
+
+        std::fputs(terminal->colors_enabled() ? "\033[0m\n" : "\n",
+                   stdout);
+        for (const std::string& candidate : completion.candidates)
+            std::fprintf(stdout, "%s\n", candidate.c_str());
+        std::fflush(stdout);
+        return CC_REDISPLAY;
+    }
+
+    static std::filesystem::path persistent_history_path()
+    {
+        if (const char* data_home = std::getenv("XDG_DATA_HOME"))
+            return std::filesystem::path(data_home) / "crepl/history";
+        if (const char* home = std::getenv("HOME"))
+            return std::filesystem::path(home) /
+                   ".local/share/crepl/history";
+        return {};
+    }
+
+    void save_history()
+    {
+        if (!history_path_.empty())
+            history(history_, &history_event_, H_SAVE,
+                    history_path_.c_str());
+    }
+
+    bool colors_enabled() const
+    {
+        return color_output;
+    }
+
+    EditLine* edit_ = nullptr;
+    History* history_ = nullptr;
+    HistEvent history_event_{};
+    std::filesystem::path history_path_;
+    unsigned execution_ = 1;
+    unsigned completed_input_lines_ = 0;
+    bool continuation_ = false;
+    std::string prompt_;
+    std::function<void()> cancel_handler_;
+    Completer completer_;
+};
 
 
 static void print_label(
@@ -3026,9 +3260,7 @@ int main()
     // REPL
     // --------------------------------------------------------
 
-    llvm::LineEditor editor("crepl");
-
-    editor.setPrompt("crepl> ");
+    Terminal terminal;
 
     std::string input;
     bool join_next_line = false;
@@ -3036,10 +3268,49 @@ int main()
     std::vector<std::string> history;
     std::map<std::string, Snapshot> snapshots;
 
+    terminal.set_cancel_handler([&] {
+        input.clear();
+        join_next_line = false;
+    });
+    terminal.set_completer(
+        [&](llvm::StringRef current_line,
+            unsigned line_number,
+            unsigned column) -> CompletionResult {
+            CompletionResult completion;
+            std::string content = input;
+            if (!content.empty())
+                content += '\n';
+            content += current_line.str();
+
+            auto compiler = builder.CreateCpp();
+            if (!compiler) {
+                llvm::consumeError(compiler.takeError());
+                return completion;
+            }
+            auto child = clang::Interpreter::create(std::move(*compiler));
+            if (!child) {
+                llvm::consumeError(child.takeError());
+                return completion;
+            }
+
+            clang::ReplCodeCompleter completer;
+            completer.codeComplete(
+                (*child)->getCompilerInstance(),
+                content,
+                line_number,
+                column + 1,
+                interpreter->getCompilerInstance(),
+                completion.candidates
+            );
+            completion.prefix = std::move(completer.Prefix);
+            return completion;
+        }
+    );
+
 
     while (
         std::optional<std::string> line =
-            read_input_line(editor)
+            terminal.read_line()
     ) {
         llvm::StringRef current =
             llvm::StringRef(*line).trim();
@@ -3068,7 +3339,12 @@ int main()
             );
             join_next_line = true;
 
-            editor.setPrompt("crepl... ");
+            terminal.set_continuation(true);
+            terminal.set_completed_input_lines(
+                static_cast<unsigned>(
+                    std::count(input.begin(), input.end(), '\n') + 1
+                )
+            );
 
             continue;
         }
@@ -3078,7 +3354,12 @@ int main()
         join_next_line = false;
 
         if (needs_more_input(input)) {
-            editor.setPrompt("crepl... ");
+            terminal.set_continuation(true);
+            terminal.set_completed_input_lines(
+                static_cast<unsigned>(
+                    std::count(input.begin(), input.end(), '\n') + 1
+                )
+            );
             continue;
         }
 
@@ -3112,7 +3393,8 @@ int main()
             print_help_line("%quit", "exit");
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
 
             continue;
         }
@@ -3127,7 +3409,8 @@ int main()
                 print_state(*state);
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3164,7 +3447,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3203,7 +3487,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3230,7 +3515,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3257,7 +3543,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3282,7 +3569,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3313,7 +3601,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3343,7 +3632,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3374,7 +3664,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3429,7 +3720,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3506,7 +3798,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3538,7 +3831,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3615,7 +3909,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3639,7 +3934,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
 
             continue;
         }
@@ -3668,7 +3964,8 @@ int main()
             }
 
             input.clear();
-            editor.setPrompt("crepl> ");
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
 
             continue;
         }
@@ -3722,7 +4019,8 @@ int main()
 
         input.clear();
 
-        editor.setPrompt("crepl> ");
+        terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
     }
 
 

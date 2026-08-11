@@ -5,6 +5,10 @@ project(crepl VERSION 0.1.0 LANGUAGES C CXX)
 find_package(LLVM REQUIRED CONFIG)
 find_package(Clang REQUIRED CONFIG)
 
+if(UNIX)
+    find_library(EDIT_LIBRARY NAMES edit REQUIRED)
+endif()
+
 if(LLVM_VERSION_MAJOR LESS 22)
     message(FATAL_ERROR "crepl requires LLVM and Clang 22 or newer")
 endif()
@@ -29,6 +33,10 @@ target_compile_definitions(crepl PRIVATE ${LLVM_DEFINITIONS_LIST})
 target_compile_definitions(crepl PRIVATE
     CREPL_CLANG_BINARY="${LLVM_TOOLS_BINARY_DIR}/clang++${CMAKE_EXECUTABLE_SUFFIX}"
 )
+
+if(UNIX)
+    target_link_libraries(crepl PRIVATE ${EDIT_LIBRARY})
+endif()
 
 if(TARGET clang-cpp)
     target_link_libraries(crepl PRIVATE clang-cpp)
