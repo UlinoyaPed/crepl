@@ -13,7 +13,7 @@ Clang REPL 对普通声明、表达式和对象的执行能力，并为裸整数
 LLVM/Clang 开发包。Fedora 可安装：
 
 ```bash
-sudo dnf install clang-devel llvm-devel gcc-c++ cmake ninja-build
+sudo dnf install clang-devel llvm-devel gcc-c++ libedit-devel cmake ninja-build
 ```
 
 CMake 会把所链接 LLVM 安装中的 `clang++` 路径编入程序。程序从该可执行文件
@@ -36,6 +36,16 @@ ctest --preset dev
 ./build/bin/crepl
 ```
 
+在本机 LLVM/Clang 22 路径可由 `llvm-config` 发现时，等价的单文件命令是：
+
+```bash
+clang++ crepl.cpp -o crepl \
+    $(llvm-config --cxxflags) -std=c++20 \
+    $(llvm-config --ldflags) \
+    -lclang-cpp -lLLVM -ledit \
+    $(llvm-config --system-libs)
+```
+
 也可以在已构建后直接运行黑盒回归测试：
 
 ```bash
@@ -44,6 +54,7 @@ tests/regression.sh
 
 宿主程序和解释器内执行的代码现在都使用 C++20。CMake 会优先链接发行版提供的
 `clang-cpp`/`LLVM` 共享目标；若发行版只提供拆分库，则回退到所需组件。
+交互终端由系统 libedit 提供，因此链接时还需要 `libedit-devel`。
 
 如果 CMake 没有自动找到 LLVM，可显式指定配置目录：
 
@@ -60,15 +71,15 @@ runner，从 LLVM 官方 APT 仓库安装 LLVM 22，以 Clang、CMake 和 Ninja 
 构建、回归测试并保存可执行文件。Ubuntu 24.04 自带的 LLVM 18 缺少本项目所用
 的较新 Clang Interpreter API，不能用于该 CI 构建。
 
-Windows 代码路径已使用 `VirtualQuery` 与 `ReadProcessMemory` 实现内存范围检查
+Windows 内存代码路径已使用 `VirtualQuery` 与 `ReadProcessMemory` 实现范围检查
 和安全复制，移除了源代码对 `/proc/self/maps`、`process_vm_readv()` 的硬依赖。
 不过 `crepl` 嵌入实验性的 Clang Interpreter，链接时需要完整 LLVM/Clang
 开发 SDK。首次 CI 探测显示，Windows x86_64 runner 没有可用的完整 SDK；
 Windows arm64 预览 runner 虽然带有 CMake package 和链接库，当前仍缺少 LLVM
 目标引用的 ARM64 `diaguids.lib`，构建会在链接前停止。因此 Windows 还不能
-作为可复现的发布目标。workflow 会在两个 Windows 架构上持续探测，SDK 完整
-时自动尝试配置和构建，并把结论写入 job summary。Windows 支持目前应视为
-实验性且未验证。
+作为可复现的发布目标。新的交互层还依赖 Unix libedit/termios，CMake 会在
+非 Unix 主机明确拒绝配置；workflow 仍在两个 Windows 架构上记录 SDK 探测
+结果。Windows 支持目前应视为未实现，而不是可用但未验证。
 
 ## 彩色输出
 
@@ -82,8 +93,9 @@ Windows arm64 预览 runner 虽然带有 CMake package 和链接库，当前仍�
 - 红色用于发生变化的 bit、不可读目标和错误前缀；
 - 紫色用于内存地址。
 
-输入颜色在 `LineEditor::readLine()` 外切换，没有把 ANSI escape 放进 prompt，
-因此不会干扰 LineEditor 的光标宽度计算。普通数值主体仍保持终端默认颜色，
+提示符的不可见 ANSI 序列通过 libedit 的 `EL_PROMPT_ESC` 标记，因此不会干扰
+光标宽度计算。当前输入采用统一绿色；LLVM 22/libedit 没有增量语法高亮回调，
+所以尚未在编辑过程中按 token 动态换色。普通数值主体仍保持终端默认颜色，
 避免高密度输出过于杂乱。输出被重定向或通过管道传递时会自动关闭颜色，
 因此脚本、测试和日志仍是纯文本。`TERM=dumb` 时也会关闭颜色；其他交互式
 终端不依赖 LLVM 内置的终端名称列表，因此 Alacritty 等新终端同样可用。
@@ -99,44 +111,53 @@ NO_COLOR=1 ./build/bin/crepl
 普通声明会进入增量编译环境；有值的裸表达式会被打印：
 
 ```text
-crepl> int x = 13;
+crepl [1]
+> int x = 13;
 
-crepl> x
+crepl [2]
+> x
 (int) 13
 bits : 0000 0000 0000 0000 0000 0000 0000 1101
 hex  :    0    0    0    0    0    0    0    d
 
-crepl> ~x
+crepl [3]
+> ~x
 (int) -14
 bits : 1111 1111 1111 1111 1111 1111 1111 0010
 hex  :    f    f    f    f    f    f    f    2
 
-crepl> (-x == ~x + 1)
+crepl [4]
+> (-x == ~x + 1)
 (bool) true
 
-crepl> unsigned char c = 13;
+crepl [5]
+> unsigned char c = 13;
 
-crepl> c
+crepl [6]
+> c
 (unsigned char) 13
 bits : 0000 1101
 hex  :    0    d
 
-crepl> 1.0 / 3
+crepl [7]
+> 1.0 / 3
 (double) 0.33333333
 ```
 
-括号、方括号或花括号尚未闭合时，REPL 会自动切换到 `crepl...` prompt：
+编号只在代码实际提交给 Interpreter 后推进；空输入和纯前端命令不推进。
+括号、方括号或花括号尚未闭合时，REPL 自动使用 `. ` continuation prompt：
 
 ```cpp
-crepl> int factorial(int n) {
-crepl... if (n <= 1)
-crepl...     return 1;
-crepl... return n * factorial(n - 1);
-crepl... }
+crepl [8]
+> int factorial(int n) {
+.   if (n <= 1)
+.       return 1;
+.   return n * factorial(n - 1);
+. }
 ```
 
-自动判断会忽略字符串、字符字面量和注释中的 delimiter。行尾 `\` 的手动
-续行方式仍然保留。当前不会把模板尖括号当作续行 delimiter；对于以 `-`
+自动判断会忽略普通/raw 字符串、字符字面量和注释中的 delimiter。行尾 `\`
+的手动续行方式仍然保留。当前不会把模板尖括号当作续行 delimiter；对于以 `-`
 或 `~` 开头而被 Clang 顶层解析器拒绝的表达式，可加括号，例如
 `(~x + 1)`。
 
@@ -338,9 +359,27 @@ new  : 0000 0000 0000 0000 0000 0000 0110 1000
 diff :                                ^^   ^ ^
 ```
 
-快照只包含拍摄时的监视集合。`%history` 列出成功执行的 C++ 输入，
-`%history 10` 只显示最后十项；多行定义算一项。成功 `%undo` 会同步移除
-最后一项历史，但 Clang Interpreter 不会回滚该输入已经产生的内存副作用。
+快照只包含拍摄时的监视集合。`%history` 列出本 session 中已提交 Interpreter
+的 execution，失败输入也会占用编号；`%history 10` 只显示最后十项，多行定义
+算一项。`%rerun n`（缩写 `%r n`）把该 execution 的原始输入作为新 execution
+执行。libedit 还把真正提交的输入持久化到
+`$XDG_DATA_HOME/crepl/history`，未设置时使用
+`~/.local/share/crepl/history`；空输入、命令和 Ctrl-C 取消内容不会写入。
+
+每个有返回值的 execution 保存一份 `clang::Value` 副本。`$_` 打印最近值，
+`$n` 打印指定 execution 的值；两者是只读前端查询，不推进 execution 编号。
+无值声明和不存在的编号会给出明确诊断。成功 `%undo` 只撤销上一段成功的增量
+编译输入；它不会回滚运行时副作用，也不会改写已经分配的 execution 编号。
+
+`%time expression` 对这次 `ParseAndExecute`、值渲染和 watch 刷新的整体墙钟
+耗时计时，并自动选择 ns/us/ms/s。LLVM 22 的公开 Interpreter API 没有稳定的
+compile/execute 分段计时接口，因此当前只报告诚实的总耗时。
+
+启动时会在内建常用头文件之后执行 `~/.config/crepl/init.hpp`（或
+`$XDG_CONFIG_HOME/crepl/init.hpp`）。文件不存在时静默跳过；诊断不会阻止进入
+REPL。`%reset` 重建 Interpreter、清除 session 状态和值、重置编号并重新执行
+startup。`%reload` 采用相同的完整 session 重建语义，以避免普通变量和函数的
+C++ 重定义；持久化编辑历史不会被删除。
 
 ## 查看内存
 
@@ -425,11 +464,22 @@ union 和 bit-field 也可检查。为避免把基类子对象或 vptr 错报成
 %layout <type>     显示 record 字段和 padding
 %state             显示全部监视值
 %snapshot <name>   保存监视状态
-%history [count]   显示成功执行的 C++ 输入
+%history [count]   显示本 session 的 execution
+%rerun <n> / %r <n> 重新执行指定输入
+%time <expr>       执行并报告整体耗时
+%reset             重建 Interpreter 和 session
+%reload            重建 session 并重新读取 init.hpp
 %undo          撤销上一段增量输入
 %lib <path>    加载动态库
 %quit          退出
+$_              打印最近一次返回值
+$n              打印 execution n 的返回值
 ```
+
+交互按键：Tab 使用当前 Clang session 做语义补全；↑/↓ 和 Ctrl-P/Ctrl-N 浏览
+历史；Ctrl-R 反向搜索持久历史；Ctrl-L 清屏。编辑时 Ctrl-C 会清除整个尚未
+提交的单行或多行区域，在同一个 execution prompt 原地重绘，不输出 `^C`、
+不记录历史，也不改变 Interpreter。运行中 JIT 代码的安全中断尚未实现。
 
 `%undo` 撤销上一段增量编译输入，但不会回滚那段代码已经造成的内存写入或
 其他运行时副作用；这是 Clang Interpreter 的原始语义。
@@ -443,6 +493,7 @@ union 和 bit-field 也可检查。为避免把基类子对象或 vptr 错报成
 - `Interpreter::ParseAndExecute(code, Value*)` 的签名；
 - `Value::Kind` 枚举和相应的 `getInt()` 等访问器；
 - `IncrementalCompilerBuilder::CreateCpp()` 的返回类型；
+- `ReplCodeCompleter::codeComplete()` 及 parent `CompilerInstance` 导入方式；
 - `clang::GetResourcesPath()` 的位置和行为；
 - `ASTContext::getIntWidth()`、record layout、field/base offset 和 template
   specialization 接口。
@@ -460,9 +511,18 @@ Interpreter 开发 SDK。
 检查不通过时回退为 Clang 默认对象输出。字段名称保持不变但语义发生变化的
 未来 ABI 仍无法仅靠 AST 完全证明安全，因此升级 libstdc++ 后应重新验证。
 
-自动多行输入由宿主侧 lexer 状态和 `()[]{}` 平衡判断完成，不调用 Clang 的
-私有 parser recovery 状态。这覆盖函数、控制块、初始化列表和跨行表达式，
-但复杂 raw string delimiter 等边界仍可能需要行尾 `\` 手动续行。
+自动多行输入由宿主侧 lexer 状态、raw string delimiter 和 `()[]{}` 平衡判断
+完成，不调用 Clang 的私有 parser recovery 状态。LLVM 22 没有公开的、可在不
+污染增量会话的前提下查询“输入是否仅因 EOF 而不完整”的 API。这覆盖函数、
+控制块、初始化列表、lambda、注释、字符串和跨行表达式，但没有显式 delimiter
+的语法续行仍可能需要行尾 `\`。
+
+Tab 首先复用 LLVM 22 的 `clang::ReplCodeCompleter`。该版本的 importer 能补全
+当前 session 的顶层用户声明，但不会递归导入 `std` NamespaceDecl 的成员；
+crepl 因此用当前 Interpreter AST 对限定命名空间做语义兜底查找，例如
+`std::vec` → `std::vector`。候选仍来自 Clang AST，不是静态字符串表。LLVM 22
+实现还把 completion source line 固定为 1，因此 continuation 行只补全已经提交
+到 session 的名字，不承诺识别尚未提交函数体中的局部声明。
 
 `crepl.cpp` 显式包含 `clang/Frontend/CompilerInstance.h`。这是必要的：
 `CreateCpp()` 返回 `std::unique_ptr<clang::CompilerInstance>`，而

@@ -5,9 +5,10 @@ project(crepl VERSION 0.1.0 LANGUAGES C CXX)
 find_package(LLVM REQUIRED CONFIG)
 find_package(Clang REQUIRED CONFIG)
 
-if(UNIX)
-    find_library(EDIT_LIBRARY NAMES edit REQUIRED)
+if(NOT UNIX)
+    message(FATAL_ERROR "crepl's interactive frontend currently requires libedit on a Unix-like host")
 endif()
+find_library(EDIT_LIBRARY NAMES edit REQUIRED)
 
 if(LLVM_VERSION_MAJOR LESS 22)
     message(FATAL_ERROR "crepl requires LLVM and Clang 22 or newer")
@@ -34,9 +35,7 @@ target_compile_definitions(crepl PRIVATE
     CREPL_CLANG_BINARY="${LLVM_TOOLS_BINARY_DIR}/clang++${CMAKE_EXECUTABLE_SUFFIX}"
 )
 
-if(UNIX)
-    target_link_libraries(crepl PRIVATE ${EDIT_LIBRARY})
-endif()
+target_link_libraries(crepl PRIVATE ${EDIT_LIBRARY})
 
 if(TARGET clang-cpp)
     target_link_libraries(crepl PRIVATE clang-cpp)

@@ -6,8 +6,10 @@
 Interpreter API. Keep changes focused and preserve ordinary declarations,
 expressions, incremental execution, and Clang's fallback `Value` printer.
 
-The main implementation is currently in `crepl.cpp`. Prefer small, explicit
-changes over broad rewrites until the file is deliberately split into modules.
+The implementation remains in `crepl.cpp`, but its boundaries are explicit:
+`Terminal` owns libedit, `run_frontend()` owns commands/execution metadata,
+session helpers own Interpreter creation/startup, and renderer functions own
+value output. Preserve those boundaries until files are deliberately split.
 
 ## Build and test
 
@@ -71,9 +73,15 @@ and tests.
 ## Terminal behavior
 
 Interactive color is enabled only for a displayed terminal when `NO_COLOR` is
-absent and `TERM` is not `dumb`. Keep ANSI escapes outside the LineEditor prompt
-string so cursor-width calculations remain correct. Piped output and tests must
-remain plain text.
+absent and `TERM` is not `dumb`. Mark invisible prompt escapes with libedit's
+`EL_PROMPT_ESC`; piped output and tests must remain plain text. During editing,
+Ctrl-C must clear and redraw the same execution region without `^C`, history,
+or Interpreter changes. Restore normal termios immediately outside line input.
+
+Completion candidates must come from `ReplCodeCompleter` or the live Clang AST,
+never a static keyword/name list. Persistent editor history and per-session
+execution metadata are distinct: only submitted code enters the former, while
+`%history`, `$n`, reset, and undo use the latter's documented semantics.
 
 ## Documentation and Git
 
