@@ -144,7 +144,8 @@ crepl [7]
 (double) 0.33333333
 ```
 
-编号只在代码实际提交给 Interpreter 后推进；空输入和纯前端命令不推进。
+编号只在代码成功通过 Clang 并执行完成后推进；空输入、纯前端命令以及编译或
+执行失败的输入都不占用 execution 编号。
 括号、方括号或花括号尚未闭合时，REPL 自动使用 `. ` continuation prompt：
 
 ```cpp
@@ -359,8 +360,8 @@ new  : 0000 0000 0000 0000 0000 0000 0110 1000
 diff :                                ^^   ^ ^
 ```
 
-快照只包含拍摄时的监视集合。`%history` 列出本 session 中已提交 Interpreter
-的 execution，失败输入也会占用编号；`%history 10` 只显示最后十项，多行定义
+快照只包含拍摄时的监视集合。`%history` 列出本 session 中成功完成的
+execution；`%history 10` 只显示最后十项，多行定义
 算一项。`%rerun n`（缩写 `%r n`）把该 execution 的原始输入作为新 execution
 执行。libedit 还把真正提交的输入持久化到
 `$XDG_DATA_HOME/crepl/history`，未设置时使用

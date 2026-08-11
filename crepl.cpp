@@ -4420,7 +4420,7 @@ static int run_frontend(
 
         clang::Value value;
         bool execution_succeeded = false;
-        const unsigned execution_number = next_execution++;
+        const unsigned execution_number = next_execution;
         const auto execution_started = std::chrono::steady_clock::now();
 
         if (
@@ -4451,22 +4451,25 @@ static int run_frontend(
         }
 
         const auto execution_finished = std::chrono::steady_clock::now();
-        std::unique_ptr<clang::Value> saved_value;
-        if (execution_succeeded && value.hasValue())
-            saved_value = std::make_unique<clang::Value>(value);
-        executions.push_back(ExecutionRecord{
-            execution_number,
-            submitted_input,
-            execution_succeeded,
-            std::move(saved_value)
-        });
-        terminal.add_history(submitted_input);
+        if (execution_succeeded) {
+            std::unique_ptr<clang::Value> saved_value;
+            if (value.hasValue())
+                saved_value = std::make_unique<clang::Value>(value);
+            executions.push_back(ExecutionRecord{
+                execution_number,
+                submitted_input,
+                true,
+                std::move(saved_value)
+            });
+            ++next_execution;
+            terminal.add_history(submitted_input);
 
-        if (timed_execution) {
-            print_label(llvm::outs(), "time : ");
-            llvm::outs() << format_duration(
-                execution_finished - execution_started
-            ) << "\n";
+            if (timed_execution) {
+                print_label(llvm::outs(), "time : ");
+                llvm::outs() << format_duration(
+                    execution_finished - execution_started
+                ) << "\n";
+            }
         }
 
 

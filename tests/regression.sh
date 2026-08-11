@@ -127,4 +127,9 @@ multiline_output=$(run_crepl $'int add(int a, int b) {\n  return a + b;\n}\nadd(
 contains "$multiline_output" '(int) 5' 'balanced function definitions must execute as one input'
 contains "$multiline_output" 'first' 'raw string literals must remain intact across input lines'
 
+valid_execution_output=$(run_crepl $'not valid C++\n1 + 1\n%history\n%quit\n')
+contains "$valid_execution_output" '[1] 1 + 1' 'invalid input must not consume an execution number'
+[[ $valid_execution_output != *'[2]'* ]] ||
+    fail 'invalid input must not appear in execution history'
+
 printf 'All crepl regression tests passed.\n'
