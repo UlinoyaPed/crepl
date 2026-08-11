@@ -191,10 +191,11 @@ libstdc++ 的 `_M_start` / `_M_finish` 字段，因此这是明确的 libstdc++ 
 `std::vector<bool>` 或检查不通过的实现会回退到 Clang 默认对象输出。
 嵌套标准容器元素暂时显示为 `<value>`，原生多维 C 数组不受此限制。
 
-所有序列视图（普通输出、`%index` 和 watch 指纹）最多处理前 256 项，超出时
-显示 `... <N more>`。因此 watch 能检测序列长度和前 256 项的变化，但不会因
-第 257 项以后的单独变化而触发输出；这是为了让每条 REPL 输入的自动监视
-成本保持有界。
+所有序列视图和 watch fingerprint 对整个对象共享 256 个叶子元素的预算，
+不是每一维各自拥有 256 项；多维数组和嵌套容器因此不会产生乘法级输出。
+超出时显示 `... <N more>`。watch 能检测序列长度和预算覆盖范围内的变化，
+但不会因预算之外的单独变化而触发输出；这是为了让每条 REPL 输入的自动
+监视成本保持有界。
 
 ## Bit 与类型检查
 
@@ -233,7 +234,9 @@ max      : 18446744073709551615
 
 类型查询通过内部 `decltype((expr))` 在 unevaluated context 中完成，不会执行
 表达式；例如 `%type ++x` 不会修改 `x`。查询产生的临时 type alias 会立即用
-`Interpreter::Undo()` 清除，也不会占用用户可见的撤销历史。
+`Interpreter::Undo()` 清除，也不会占用用户可见的撤销历史。整数位宽来自
+`ASTContext::getIntWidth()`，min/max 使用 `llvm::APInt` 计算，因此
+`__int128` 和 `_BitInt(N)` 不受宿主 `uint64_t` 位宽限制。
 
 ## 指针输出
 
@@ -283,7 +286,7 @@ hex  :    0    0    0    0    0    0    1    b
 ```
 
 当前支持标量、指针、原生 C 数组、`std::array` 和普通 `std::vector`。
-序列任一元素变化时会打印新状态：
+预算覆盖范围内的序列元素变化时会打印新状态：
 
 ```text
 crepl> %watch a
@@ -292,6 +295,15 @@ crepl> a[2] = 3;
 a:
 (int[5]) [5, 2, 3, 1, 7]
 ```
+
+watch 的状态判定不使用 pretty-print 文本：sequence fingerprint 会递归记录
+类型、元素数量和元素状态。因此即使嵌套 vector 当前显示为 `[<value>]`，
+其内部元素变化仍会触发 watch 和 snapshot diff；暂不理解的 record 则记录
+受字节预算约束的 object representation，而不是固定占位符。
+
+有返回值的裸表达式总是先输出自身结果，再输出 watch 更新。例如 `x++` 会先
+显示旧值，再显示 watch 中的新 `x`。写成 `x++;` 时属于 Clang 的
+discarded-value statement，不产生表达式结果，但 watch 仍会更新。
 
 不带参数的 `%watch` 列出监视项。`%unwatch x` 删除指定监视项；不带参数的
 `%unwatch` 清空全部监视项。监视求值产生的内部增量编译单元会立即撤销，
@@ -360,7 +372,7 @@ crepl> %mem p 32
 
 两种形式的差别是：`%mem p` 查看指针变量 `p` 自身的 `sizeof(p)` 个字节，
 而 `%mem p 32` 查看 `p` 指向地址开始的 32 字节。单次长度限制为
-1–65536 字节。
+1–65536 字节；该限制同时应用于显式长度和默认 `sizeof(object)` 路径。
 
 读取前程序会检查内存映射，拒绝 null、地址溢出、未映射或不可读的范围；
 Linux 使用 `/proc/self/maps` 与 `process_vm_readv()`，Windows 使用
@@ -432,8 +444,8 @@ union 和 bit-field 也可检查。为避免把基类子对象或 vptr 错报成
 - `Value::Kind` 枚举和相应的 `getInt()` 等访问器；
 - `IncrementalCompilerBuilder::CreateCpp()` 的返回类型；
 - `clang::GetResourcesPath()` 的位置和行为；
-- `ASTContext` 的 record layout、field/base offset 和 template specialization
-  接口。
+- `ASTContext::getIntWidth()`、record layout、field/base offset 和 template
+  specialization 接口。
 
 变量监视、快照和辅助捕获依赖 `Interpreter::Undo()` 清理内部求值产生的增量
 编译单元；`%type` 则用同一机制清理 unevaluated type alias。Linux 内存范围

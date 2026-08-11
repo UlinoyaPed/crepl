@@ -10,6 +10,8 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/LineEditor/LineEditor.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Program.h"
@@ -358,6 +360,7 @@ static void print_integer(
 // ============================================================
 
 static constexpr std::size_t sequence_display_limit = 256;
+static constexpr std::size_t memory_display_limit = 65536;
 
 
 static std::uint64_t load_integer_bits(
@@ -386,7 +389,8 @@ static void print_array_element(
     llvm::raw_ostream& out,
     const clang::ASTContext& context,
     clang::QualType type,
-    const unsigned char* data
+    const unsigned char* data,
+    std::size_t& remaining_leaves
 );
 
 
@@ -394,7 +398,8 @@ static void print_array_data(
     llvm::raw_ostream& out,
     const clang::ASTContext& context,
     const clang::ConstantArrayType& array,
-    const unsigned char* data
+    const unsigned char* data,
+    std::size_t& remaining_leaves
 )
 {
     const clang::QualType element_type =
@@ -404,23 +409,21 @@ static void print_array_data(
     const std::size_t stride = static_cast<std::size_t>(
         context.getTypeSizeInChars(element_type).getQuantity()
     );
-    const std::uint64_t displayed = std::min<std::uint64_t>(
-        count,
-        sequence_display_limit
-    );
-
     out << "[";
+    std::uint64_t displayed = 0;
 
-    for (std::uint64_t index = 0; index < displayed; ++index) {
-        if (index != 0)
+    while (displayed < count && remaining_leaves != 0) {
+        if (displayed != 0)
             out << ", ";
 
         print_array_element(
             out,
             context,
             element_type,
-            data + index * stride
+            data + displayed * stride,
+            remaining_leaves
         );
+        ++displayed;
     }
 
     if (displayed < count) {
@@ -471,14 +474,25 @@ static void print_array_element(
     llvm::raw_ostream& out,
     const clang::ASTContext& context,
     clang::QualType type,
-    const unsigned char* data
+    const unsigned char* data,
+    std::size_t& remaining_leaves
 )
 {
     if (const auto* nested =
             context.getAsConstantArrayType(type)) {
-        print_array_data(out, context, *nested, data);
+        print_array_data(
+            out,
+            context,
+            *nested,
+            data,
+            remaining_leaves
+        );
         return;
     }
+
+    if (remaining_leaves == 0)
+        return;
+    --remaining_leaves;
 
     const std::size_t size = static_cast<std::size_t>(
         context.getTypeSizeInChars(type).getQuantity()
@@ -537,11 +551,13 @@ static bool print_array(
     value.printType(out);
     reset_color(out);
     out << ") ";
+    std::size_t remaining_leaves = sequence_display_limit;
     print_array_data(
         out,
         context,
         *array,
-        static_cast<const unsigned char*>(value.getPtr())
+        static_cast<const unsigned char*>(value.getPtr()),
+        remaining_leaves
     );
     out << "\n";
     return true;
@@ -724,12 +740,11 @@ static std::optional<FieldLocation> find_field_location(
 
 
 static std::optional<SequenceInfo> get_sequence_info(
-    const clang::Value& value
+    const clang::ASTContext& context,
+    clang::QualType type,
+    std::uintptr_t object
 )
 {
-    const clang::ASTContext& context = value.getASTContext();
-    clang::QualType type = value.getType();
-
     if (type->isReferenceType())
         type = type->getPointeeType();
 
@@ -737,7 +752,7 @@ static std::optional<SequenceInfo> get_sequence_info(
         return SequenceInfo{
             &context,
             array->getElementType(),
-            reinterpret_cast<std::uintptr_t>(value.getPtr()),
+            object,
             static_cast<std::size_t>(array->getSize().getZExtValue())
         };
     }
@@ -761,9 +776,6 @@ static std::optional<SequenceInfo> get_sequence_info(
 
     const clang::QualType element_type =
         element_argument.getAsType();
-    const std::uintptr_t object =
-        reinterpret_cast<std::uintptr_t>(value.getPtr());
-
     if (qualified_name == "std::array") {
         const clang::TemplateArgument& count_argument =
             specialization->getTemplateArgs().get(1);
@@ -860,10 +872,23 @@ static std::optional<SequenceInfo> get_sequence_info(
 }
 
 
+static std::optional<SequenceInfo> get_sequence_info(
+    const clang::Value& value
+)
+{
+    return get_sequence_info(
+        value.getASTContext(),
+        value.getType(),
+        reinterpret_cast<std::uintptr_t>(value.getPtr())
+    );
+}
+
+
 static std::string sequence_element_string(
     const SequenceInfo& sequence,
     const unsigned char* data,
-    std::size_t index
+    std::size_t index,
+    std::size_t& remaining_leaves
 )
 {
     const std::size_t stride = static_cast<std::size_t>(
@@ -876,10 +901,49 @@ static std::string sequence_element_string(
         out,
         *sequence.context,
         sequence.element_type,
-        data + index * stride
+        data + index * stride,
+        remaining_leaves
     );
     out.flush();
     return result;
+}
+
+
+static std::optional<std::size_t> sequence_prefix_size(
+    const clang::ASTContext& context,
+    clang::QualType element_type,
+    std::size_t count,
+    std::size_t leaf_limit
+)
+{
+    std::size_t leaves = std::min(count, leaf_limit);
+
+    while (const auto* array =
+               context.getAsConstantArrayType(element_type)) {
+        const std::uint64_t nested_count =
+            array->getSize().getZExtValue();
+
+        if (leaves != 0 &&
+            nested_count > leaf_limit / leaves) {
+            leaves = leaf_limit;
+        }
+        else {
+            leaves *= static_cast<std::size_t>(nested_count);
+        }
+
+        element_type = array->getElementType();
+    }
+
+    const std::size_t leaf_size = static_cast<std::size_t>(
+        context.getTypeSizeInChars(element_type).getQuantity()
+    );
+
+    if (leaf_size != 0 &&
+        leaves > std::numeric_limits<std::size_t>::max() / leaf_size) {
+        return std::nullopt;
+    }
+
+    return leaves * leaf_size;
 }
 
 
@@ -902,13 +966,18 @@ static bool print_sequence(
         sequence_display_limit
     );
 
-    if (stride != 0 &&
-        displayed >
-            std::numeric_limits<std::size_t>::max() / stride) {
+    const auto storage_size = sequence_prefix_size(
+        *sequence->context,
+        sequence->element_type,
+        sequence->count,
+        sequence_display_limit
+    );
+
+    if (!storage_size) {
         return false;
     }
 
-    std::vector<unsigned char> storage(displayed * stride);
+    std::vector<unsigned char> storage(*storage_size);
 
     if (!storage.empty() &&
         !read_memory(
@@ -924,21 +993,25 @@ static bool print_sequence(
     value.printType(out);
     reset_color(out);
     out << ") [";
+    std::size_t remaining_leaves = sequence_display_limit;
+    std::size_t rendered = 0;
 
-    for (std::size_t index = 0; index < displayed; ++index) {
-        if (index != 0)
+    while (rendered < displayed && remaining_leaves != 0) {
+        if (rendered != 0)
             out << ", ";
         out << sequence_element_string(
             *sequence,
             storage.data(),
-            index
+            rendered,
+            remaining_leaves
         );
+        ++rendered;
     }
 
-    if (displayed < sequence->count) {
-        if (displayed != 0)
+    if (rendered < sequence->count) {
+        if (rendered != 0)
             out << ", ";
-        out << "... <" << sequence->count - displayed << " more>";
+        out << "... <" << sequence->count - rendered << " more>";
     }
 
     out << "]\n";
@@ -965,13 +1038,18 @@ static bool print_sequence_index(
         sequence_display_limit
     );
 
-    if (stride == 0 ||
-        displayed >
-            std::numeric_limits<std::size_t>::max() / stride) {
+    const auto storage_size = sequence_prefix_size(
+        *sequence->context,
+        sequence->element_type,
+        sequence->count,
+        sequence_display_limit
+    );
+
+    if (stride == 0 || !storage_size) {
         return false;
     }
 
-    std::vector<unsigned char> storage(displayed * stride);
+    std::vector<unsigned char> storage(*storage_size);
 
     if (!storage.empty() &&
         !read_memory(
@@ -985,13 +1063,17 @@ static bool print_sequence_index(
     std::vector<std::string> indexes;
     std::vector<std::string> values;
     std::vector<std::size_t> widths;
+    std::size_t remaining_leaves = sequence_display_limit;
 
-    for (std::size_t index = 0; index < displayed; ++index) {
+    for (std::size_t index = 0;
+         index < displayed && remaining_leaves != 0;
+         ++index) {
         indexes.push_back(std::to_string(index));
         values.push_back(sequence_element_string(
             *sequence,
             storage.data(),
-            index
+            index,
+            remaining_leaves
         ));
         widths.push_back(std::max(
             indexes.back().size(),
@@ -1000,19 +1082,19 @@ static bool print_sequence_index(
     }
 
     print_label(out, "index :");
-    for (std::size_t index = 0; index < displayed; ++index)
+    for (std::size_t index = 0; index < indexes.size(); ++index)
         out << " " << centered(indexes[index], widths[index]);
 
-    if (displayed < sequence->count)
+    if (indexes.size() < sequence->count)
         out << " ...";
 
     out << "\n";
     print_label(out, "value :");
-    for (std::size_t index = 0; index < displayed; ++index)
+    for (std::size_t index = 0; index < values.size(); ++index)
         out << " " << centered(values[index], widths[index]);
 
-    if (displayed < sequence->count)
-        out << " <" << sequence->count - displayed << " more>";
+    if (values.size() < sequence->count)
+        out << " <" << sequence->count - values.size() << " more>";
 
     out << "\n";
     return true;
@@ -1065,22 +1147,13 @@ static void print_pointer_target(
     );
 
     if (array) {
-        const std::size_t stride = static_cast<std::size_t>(
-            context.getTypeSizeInChars(array->getElementType())
-                .getQuantity()
-        );
-        const std::size_t displayed = std::min<std::size_t>(
+        const auto prefix_size = sequence_prefix_size(
+            context,
+            array->getElementType(),
             static_cast<std::size_t>(array->getSize().getZExtValue()),
             sequence_display_limit
         );
-
-        if (stride != 0 &&
-            displayed > std::numeric_limits<std::size_t>::max() / stride) {
-            read_size = 0;
-        }
-        else {
-            read_size = displayed * stride;
-        }
+        read_size = prefix_size.value_or(0);
     }
     else if (!type->isIntegerType() &&
              !type->isRealFloatingType() &&
@@ -1110,7 +1183,14 @@ static void print_pointer_target(
 
     if (array) {
         print_arrow_type(out, indent, type_name);
-        print_array_data(out, context, *array, data);
+        std::size_t remaining_leaves = sequence_display_limit;
+        print_array_data(
+            out,
+            context,
+            *array,
+            data,
+            remaining_leaves
+        );
         out << "\n";
         return;
     }
@@ -1156,7 +1236,14 @@ static void print_pointer_target(
 
     if (type->isRealFloatingType()) {
         print_arrow_type(out, indent, type_name);
-        print_array_element(out, context, type, data);
+        std::size_t remaining_leaves = 1;
+        print_array_element(
+            out,
+            context,
+            type,
+            data,
+            remaining_leaves
+        );
         out << "\n";
         return;
     }
@@ -1433,6 +1520,145 @@ static std::string value_string(
 }
 
 
+struct FingerprintBudget {
+    std::size_t leaves = sequence_display_limit;
+    std::size_t bytes = 65536;
+};
+
+
+static void append_fingerprint_number(
+    std::string& fingerprint,
+    std::uint64_t number
+)
+{
+    fingerprint += std::to_string(number);
+    fingerprint += ';';
+}
+
+
+static void append_object_fingerprint(
+    const clang::ASTContext& context,
+    clang::QualType type,
+    std::uintptr_t address,
+    FingerprintBudget& budget,
+    std::string& fingerprint
+)
+{
+    if (type->isReferenceType())
+        type = type->getPointeeType();
+    type = type.getCanonicalType();
+
+    const std::string type_name =
+        type.getAsString(context.getPrintingPolicy());
+    fingerprint += 'T';
+    append_fingerprint_number(fingerprint, type_name.size());
+    fingerprint += type_name;
+
+    if (const auto sequence =
+            get_sequence_info(context, type, address)) {
+        fingerprint += 'S';
+        append_fingerprint_number(fingerprint, sequence->count);
+
+        const std::size_t stride = static_cast<std::size_t>(
+            context.getTypeSizeInChars(sequence->element_type)
+                .getQuantity()
+        );
+        std::size_t index = 0;
+
+        while (index < sequence->count && budget.leaves != 0) {
+            if (stride == 0 ||
+                index >
+                    (std::numeric_limits<std::uintptr_t>::max() -
+                     sequence->data) /
+                        stride) {
+                fingerprint += "invalid;";
+                return;
+            }
+
+            append_object_fingerprint(
+                context,
+                sequence->element_type,
+                sequence->data + index * stride,
+                budget,
+                fingerprint
+            );
+            ++index;
+        }
+
+        fingerprint += 'R';
+        append_fingerprint_number(
+            fingerprint,
+            sequence->count - index
+        );
+        return;
+    }
+
+    if (budget.leaves == 0) {
+        fingerprint += "budget;";
+        return;
+    }
+    --budget.leaves;
+
+    const auto size = context.getTypeSizeInCharsIfKnown(type);
+
+    if (!size) {
+        fingerprint += "incomplete;";
+        return;
+    }
+
+    const std::size_t object_size = static_cast<std::size_t>(
+        size->getQuantity()
+    );
+    const std::size_t copied_size = std::min(object_size, budget.bytes);
+    fingerprint += 'O';
+    append_fingerprint_number(fingerprint, object_size);
+    append_fingerprint_number(fingerprint, copied_size);
+
+    if (copied_size == 0) {
+        fingerprint += "budget;";
+        return;
+    }
+
+    std::vector<unsigned char> bytes(copied_size);
+
+    if (!read_memory(address, bytes.data(), bytes.size())) {
+        fingerprint += "unreadable;";
+        append_fingerprint_number(fingerprint, address);
+        return;
+    }
+
+    budget.bytes -= copied_size;
+    fingerprint.append(
+        reinterpret_cast<const char*>(bytes.data()),
+        bytes.size()
+    );
+}
+
+
+static std::string value_fingerprint(
+    const clang::Value& value,
+    llvm::StringRef type_name,
+    llvm::StringRef rendered
+)
+{
+    if (value.getKind() != clang::Value::K_PtrOrObj ||
+        value.getType()->isPointerType()) {
+        return (type_name + "\n" + rendered).str();
+    }
+
+    FingerprintBudget budget;
+    std::string fingerprint;
+    append_object_fingerprint(
+        value.getASTContext(),
+        value.getType(),
+        reinterpret_cast<std::uintptr_t>(value.getPtr()),
+        budget,
+        fingerprint
+    );
+    return fingerprint;
+}
+
+
 static void print_error(llvm::Error error);
 
 
@@ -1647,13 +1873,18 @@ static llvm::Expected<CapturedValue> capture_expression(
             type_out.flush();
 
             const std::string rendered = value_string(value);
+            const std::string fingerprint = value_fingerprint(
+                value,
+                type,
+                rendered
+            );
 
             captured = CapturedValue{
                 value.getKind(),
                 value.getType()->isArrayType(),
                 value.getType()->isPointerType(),
                 get_sequence_info(value).has_value(),
-                type + "\n" + rendered,
+                fingerprint,
                 rendered
             };
         }
@@ -1763,11 +1994,18 @@ static llvm::Expected<MemoryRegion> capture_memory_region(
             }
 
             if (!validation_error) {
-                region = MemoryRegion{
-                    address,
-                    size,
-                    type.getAsString(context.getPrintingPolicy())
-                };
+                if (size == 0 || size > memory_display_limit) {
+                    validation_error =
+                        "byte count must be between 1 and " +
+                        std::to_string(memory_display_limit);
+                }
+                else {
+                    region = MemoryRegion{
+                        address,
+                        size,
+                        type.getAsString(context.getPrintingPolicy())
+                    };
+                }
             }
         }
     }
@@ -1872,8 +2110,8 @@ static TypeInfo make_type_info(
 
     const bool is_integer =
         type->isIntegerType() || type->isEnumeralType();
-    const unsigned width = is_integer && size
-        ? static_cast<unsigned>(size->getQuantity() * CHAR_BIT)
+    const unsigned width = is_integer
+        ? context.getIntWidth(type)
         : 0;
 
     return TypeInfo{
@@ -2065,25 +2303,16 @@ static std::string integer_limit(
     unsigned width
 )
 {
-    if (!is_signed) {
-        if (minimum)
-            return "0";
-
-        const std::uint64_t maximum = width == 64
-            ? std::numeric_limits<std::uint64_t>::max()
-            : (std::uint64_t{1} << width) - 1;
-        return std::to_string(maximum);
-    }
-
-    if (width == 64) {
-        return minimum
-            ? std::to_string(std::numeric_limits<std::int64_t>::min())
-            : std::to_string(std::numeric_limits<std::int64_t>::max());
-    }
-
-    const std::int64_t boundary =
-        std::int64_t{1} << (width - 1);
-    return std::to_string(minimum ? -boundary : boundary - 1);
+    const llvm::APInt value = !is_signed
+        ? (minimum
+               ? llvm::APInt::getZero(width)
+               : llvm::APInt::getMaxValue(width))
+        : (minimum
+               ? llvm::APInt::getSignedMinValue(width)
+               : llvm::APInt::getSignedMaxValue(width));
+    llvm::SmallString<128> text;
+    value.toString(text, 10, is_signed, false);
+    return text.str().str();
 }
 
 
@@ -3345,10 +3574,11 @@ int main()
                             parsed_size
                         ) ||
                         parsed_size == 0 ||
-                        parsed_size > 65536) {
+                        parsed_size > memory_display_limit) {
                         llvm::errs()
                             << "error: byte count must be between 1 and "
-                            << "65536\n";
+                            << memory_display_limit
+                            << "\n";
                     }
                     else {
                         requested_size =
@@ -3460,7 +3690,6 @@ int main()
         // ----------------------------------------------------
 
         clang::Value value;
-        std::optional<std::string> result_output;
         bool execution_succeeded = false;
 
         if (
@@ -3475,7 +3704,6 @@ int main()
             );
         }
         else if (value.hasValue()) {
-            result_output = value_string(value);
             execution_succeeded = true;
         }
         else {
@@ -3484,11 +3712,11 @@ int main()
 
         if (execution_succeeded) {
             history.push_back(input);
-            const bool watched_changed =
-                refresh_watches(*interpreter, watches);
 
-            if (!watched_changed && result_output)
+            if (value.hasValue())
                 print_value(llvm::outs(), value);
+
+            refresh_watches(*interpreter, watches);
         }
 
 

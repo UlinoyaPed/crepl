@@ -37,6 +37,13 @@ type_values=$(grep -Fc '(int) 1' <<<"$type_output")
 contains "$type_output" 'type     : int' '%type must report the canonical type'
 [[ $type_output != *$'\033'* ]] || fail 'piped input and output must not contain ANSI colors'
 
+wide_type_output=$(run_crepl $'%type (__int128)0\n%type (unsigned __int128)0\n%type (_BitInt(17))0\n%quit\n')
+contains "$wide_type_output" 'min      : -170141183460469231731687303715884105728' 'signed __int128 must have the correct minimum'
+contains "$wide_type_output" 'max      : 170141183460469231731687303715884105727' 'signed __int128 must have the correct maximum'
+contains "$wide_type_output" 'max      : 340282366920938463463374607431768211455' 'unsigned __int128 must have the correct maximum'
+contains "$wide_type_output" 'bits     : 17' '_BitInt must use its semantic integer width'
+contains "$wide_type_output" 'min      : -65536' 'signed _BitInt(17) must have the correct minimum'
+
 if command -v socat >/dev/null 2>&1; then
     pty_output=$(
         printf '%%quit\n' |
@@ -55,6 +62,31 @@ sequence_output=$(run_crepl $'int a[300] = {};\na\n%index a\n%watch a\na[299] = 
 contains "$sequence_output" '... <44 more>' 'large sequences must report truncated elements'
 watch_changes=$(grep -c '^a:$' <<<"$sequence_output" || true)
 [[ $watch_changes -eq 1 ]] || fail 'watch fingerprints must be bounded to the displayed sequence prefix'
+
+nested_watch_output=$(run_crepl $'#include <vector>\nstd::vector<std::vector<int>> nested{{1}};\n%watch nested\n%snapshot nested_before\nnested[0][0] = 2;\n%snapshot nested_after\n%diff nested_before nested_after\n%quit\n')
+nested_changes=$(grep -c '^nested:$' <<<"$nested_watch_output" || true)
+[[ $nested_changes -eq 2 ]] || fail 'nested vector changes must affect watch and snapshot fingerprints'
+contains "$nested_watch_output" 'before:' 'nested sequence snapshot diff must include its before state'
+contains "$nested_watch_output" 'after:' 'nested sequence snapshot diff must include its after state'
+
+cube_output=$(run_crepl $'int cube[16][16][16] = {};\ncube\n%watch cube\ncube[0][0][0] = 1;\n%quit\n')
+contains "$cube_output" '... <15 more>' 'multidimensional arrays must share one leaf rendering budget'
+[[ ${#cube_output} -lt 3000 ]] || fail 'multidimensional array output must remain globally bounded'
+cube_changes=$(grep -c '^cube:$' <<<"$cube_output" || true)
+[[ $cube_changes -eq 1 ]] || fail 'bounded multidimensional arrays must remain watchable'
+
+memory_limit_output=$(run_crepl $'char big[65537] = {};\n%mem big\n%quit\n')
+contains "$memory_limit_output" 'byte count must be between 1 and 65536' 'default %mem object sizes must respect the display limit'
+[[ $memory_limit_output != *'address :'* ]] || fail 'oversized default %mem requests must not read or render memory'
+
+postincrement_output=$(run_crepl $'int watched = 1;\n%watch watched\nwatched++\n%quit\n')
+postincrement_old=$(grep -Fc '(int) 1' <<<"$postincrement_output")
+postincrement_new=$(grep -Fc '(int) 2' <<<"$postincrement_output")
+[[ $postincrement_old -eq 1 && $postincrement_new -eq 1 ]] ||
+    fail 'a watched post-increment must print both its result and new state'
+result_line=$(grep -n -m1 -F '(int) 1' <<<"$postincrement_output" | cut -d: -f1)
+watch_line=$(grep -n -m1 -F 'watched:' <<<"$postincrement_output" | cut -d: -f1)
+[[ $result_line -lt $watch_line ]] || fail 'expression results must precede watch updates'
 
 state_output=$(run_crepl $'int n = 1;\n%watch n\n%snapshot before\nn = 2;\n%snapshot after\n%undo\n%state\n%diff before after\n%quit\n')
 contains "$state_output" 'saved snapshot before' 'the before snapshot must be retained'
