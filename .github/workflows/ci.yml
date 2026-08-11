@@ -23,7 +23,7 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install LLVM 22, Clang, CMake, and Ninja
         run: |
@@ -82,7 +82,7 @@ jobs:
             runner: windows-11-arm
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Probe LLVM and Clang development packages
         shell: pwsh
