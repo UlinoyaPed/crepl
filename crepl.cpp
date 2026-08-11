@@ -14,6 +14,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/WithColor.h"
@@ -38,7 +39,6 @@
 #include <set>
 #include <csignal>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <type_traits>
@@ -110,7 +110,7 @@ public:
         : history_(history_init())
     {
         if (!history_)
-            throw std::runtime_error("could not initialize libedit");
+            llvm::report_fatal_error("could not initialize libedit");
 
 #if defined(_WIN32)
         interactive_ = true;
@@ -130,7 +130,7 @@ public:
         edit_ = el_init("crepl", stdin, stdout, stderr);
         restore_normal_termios();
         if (!edit_)
-            throw std::runtime_error("could not initialize libedit");
+            llvm::report_fatal_error("could not initialize libedit");
 
         history(history_, &history_event_, H_SETSIZE, 10000);
         configure_editline();
@@ -263,7 +263,7 @@ private:
         edit_ = el_init("crepl", stdin, stdout, stderr);
         restore_normal_termios();
         if (!edit_)
-            throw std::runtime_error("could not reset libedit");
+            llvm::report_fatal_error("could not reset libedit");
         configure_editline();
     }
 
@@ -2093,24 +2093,32 @@ static CompletionResult complete_qualified_name(
 
     llvm::StringRef qualifier = token.take_front(separator);
     result.prefix = token.drop_front(separator + 2).str();
-    const clang::DeclContext* context = ast.getTranslationUnitDecl();
+    std::vector<const clang::DeclContext*> contexts;
+    for (const clang::TranslationUnitDecl* translation_unit =
+             ast.getTranslationUnitDecl();
+         translation_unit != nullptr;
+         translation_unit = translation_unit->getPreviousDecl()) {
+        contexts.push_back(translation_unit);
+    }
 
     while (!qualifier.empty()) {
         const auto split = qualifier.split("::");
         const llvm::StringRef component = split.first;
         qualifier = split.second;
-        const clang::NamespaceDecl* found = nullptr;
-        for (const clang::Decl* declaration : context->decls()) {
-            const auto* namespace_decl =
-                llvm::dyn_cast<clang::NamespaceDecl>(declaration);
-            if (namespace_decl && namespace_decl->getName() == component) {
-                found = namespace_decl;
-                break;
+        std::vector<const clang::DeclContext*> nested;
+        for (const clang::DeclContext* context : contexts) {
+            for (const clang::Decl* declaration : context->decls()) {
+                const auto* namespace_decl =
+                    llvm::dyn_cast<clang::NamespaceDecl>(declaration);
+                if (namespace_decl &&
+                    namespace_decl->getName() == component) {
+                    nested.push_back(namespace_decl);
+                }
             }
         }
-        if (!found)
+        if (nested.empty())
             return {};
-        context = found;
+        contexts = std::move(nested);
     }
 
     std::set<std::string> names;
@@ -2124,12 +2132,14 @@ static CompletionResult complete_qualified_name(
                 names.insert(name.str());
         }
     };
-    collect(context);
-    if (const auto* namespace_context =
-            llvm::dyn_cast<clang::NamespaceDecl>(context)) {
-        for (const clang::NamespaceDecl* redeclaration :
-             namespace_context->redecls()) {
-            collect(redeclaration);
+    for (const clang::DeclContext* context : contexts) {
+        collect(context);
+        if (const auto* namespace_context =
+                llvm::dyn_cast<clang::NamespaceDecl>(context)) {
+            for (const clang::NamespaceDecl* redeclaration :
+                 namespace_context->redecls()) {
+                collect(redeclaration);
+            }
         }
     }
     result.candidates.assign(names.begin(), names.end());
