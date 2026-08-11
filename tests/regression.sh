@@ -4,6 +4,8 @@ set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 binary=${CREPL_BINARY:-"$project_dir/build/bin/crepl"}
+test_root=$(mktemp -d)
+trap 'rm -rf -- "$test_root"' EXIT
 
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
@@ -94,5 +96,35 @@ contains "$state_output" 'saved snapshot after' 'the after snapshot must be reta
 contains "$state_output" '(int) 2' '%undo must preserve documented runtime side effects'
 contains "$state_output" 'old  : 0000' 'snapshot diff must render its before state'
 contains "$state_output" 'new  : 0000' 'snapshot diff must render its after state'
+
+mkdir -p "$test_root/config/crepl"
+printf 'int startup_magic = 40;\n' >"$test_root/config/crepl/init.hpp"
+frontend_output=$(
+    printf '%s\n' \
+        'startup_magic + 2' \
+        'int no_value = 1;' \
+        '$1' \
+        '$2' \
+        '%history' \
+        '%rerun 1' \
+        '%time startup_magic + 3' \
+        '%reset' \
+        'startup_magic' \
+        '%quit' |
+        XDG_CONFIG_HOME="$test_root/config" \
+        XDG_DATA_HOME="$test_root/data" \
+        "$binary" 2>&1
+)
+contains "$frontend_output" 'crepl: execution 2 produced no value' '$n must diagnose value-less executions'
+contains "$frontend_output" '[1] startup_magic + 2' '%history must use execution numbers'
+contains "$frontend_output" 'time :' '%time must report a measured total duration'
+contains "$frontend_output" 'session reset' '%reset must confirm the new session'
+contains "$frontend_output" '(int) 40' '%reset must execute init.hpp again'
+[[ -s "$test_root/data/crepl/history" ]] ||
+    fail 'submitted code must be saved in persistent editor history'
+
+multiline_output=$(run_crepl $'int add(int a, int b) {\n  return a + b;\n}\nadd(2, 3)\nconst char* raw = R"tag(first\n  second)tag";\nraw\n%quit\n')
+contains "$multiline_output" '(int) 5' 'balanced function definitions must execute as one input'
+contains "$multiline_output" 'first' 'raw string literals must remain intact across input lines'
 
 printf 'All crepl regression tests passed.\n'

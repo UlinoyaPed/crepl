@@ -36,6 +36,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <csignal>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -51,6 +52,7 @@
 #include <windows.h>
 #else
 #include <sys/uio.h>
+#include <termios.h>
 #include <unistd.h>
 #endif
 
@@ -105,29 +107,33 @@ public:
     )>;
 
     Terminal()
-        : edit_(el_init("crepl", stdin, stdout, stderr)),
-          history_(history_init())
+        : history_(history_init())
     {
-        if (!edit_ || !history_)
+        if (!history_)
             throw std::runtime_error("could not initialize libedit");
 
-        el_set(edit_, EL_CLIENTDATA, this);
-        el_set(edit_, EL_EDITOR, "emacs");
-        el_set(edit_, EL_SIGNAL, 0);
-        el_set(edit_, EL_PROMPT_ESC, &Terminal::prompt_callback, '\1');
-        el_set(edit_, EL_HIST, history, history_);
-        history(history_, &history_event_, H_SETSIZE, 10000);
+#if defined(_WIN32)
+        interactive_ = true;
+#else
+        interactive_ = ::isatty(STDIN_FILENO) && ::isatty(STDOUT_FILENO);
+        if (interactive_ && tcgetattr(STDIN_FILENO, &normal_termios_) == 0) {
+            editing_termios_ = normal_termios_;
+            editing_termios_.c_lflag &= ~ISIG;
+#if defined(ECHOCTL)
+            editing_termios_.c_lflag &= ~ECHOCTL;
+#endif
+            have_termios_ = true;
+            tcsetattr(STDIN_FILENO, TCSANOW, &editing_termios_);
+        }
+#endif
 
-        el_set(edit_, EL_ADDFN, "crepl-cancel", "clear current input",
-               &Terminal::cancel_callback);
-        el_set(edit_, EL_ADDFN, "crepl-complete", "complete C++ name",
-               &Terminal::complete_callback);
-        el_set(edit_, EL_BIND, "^C", "crepl-cancel", nullptr);
-        el_set(edit_, EL_BIND, "^I", "crepl-complete", nullptr);
-        el_set(edit_, EL_BIND, "^P", "ed-prev-history", nullptr);
-        el_set(edit_, EL_BIND, "^N", "ed-next-history", nullptr);
-        el_set(edit_, EL_BIND, "^R", "em-inc-search-prev", nullptr);
-        el_set(edit_, EL_BIND, "^L", "ed-clear-screen", nullptr);
+        edit_ = el_init("crepl", stdin, stdout, stderr);
+        restore_normal_termios();
+        if (!edit_)
+            throw std::runtime_error("could not initialize libedit");
+
+        history(history_, &history_event_, H_SETSIZE, 10000);
+        configure_editline();
 
         history_path_ = persistent_history_path();
         if (!history_path_.empty()) {
@@ -147,6 +153,7 @@ public:
             history_end(history_);
         if (edit_)
             el_end(edit_);
+        restore_normal_termios();
     }
 
     Terminal(const Terminal&) = delete;
@@ -179,22 +186,45 @@ public:
 
     std::optional<std::string> read_line()
     {
-        int count = 0;
-        const char* line = el_gets(edit_, &count);
+        for (;;) {
+            if (interactive_ && !continuation_)
+                print_header();
+
+            int count = 0;
+            use_editing_termios();
+#if !defined(_WIN32)
+            struct sigaction action{};
+            struct sigaction previous{};
+            action.sa_handler = &Terminal::interrupt_handler;
+            sigemptyset(&action.sa_mask);
+            interrupted_ = 0;
+            sigaction(SIGINT, &action, &previous);
+#endif
+            const char* line = el_gets(edit_, &count);
+            restore_normal_termios();
+#if !defined(_WIN32)
+            sigaction(SIGINT, &previous, nullptr);
+            if (interrupted_) {
+                clear_editing_region();
+                reset_editline();
+                continue;
+            }
+#endif
         if (colors_enabled()) {
             std::fputs("\033[0m", stdout);
             std::fflush(stdout);
         }
 
-        if (!line)
-            return std::nullopt;
+            if (!line)
+                return std::nullopt;
 
-        std::string result(line, static_cast<std::size_t>(count));
-        while (!result.empty() &&
-               (result.back() == '\n' || result.back() == '\r')) {
-            result.pop_back();
+            std::string result(line, static_cast<std::size_t>(count));
+            while (!result.empty() &&
+                   (result.back() == '\n' || result.back() == '\r')) {
+                result.pop_back();
+            }
+            return result;
         }
-        return result;
     }
 
     void add_history(llvm::StringRef input)
@@ -206,6 +236,37 @@ public:
     }
 
 private:
+    void configure_editline()
+    {
+        el_set(edit_, EL_CLIENTDATA, this);
+        el_set(edit_, EL_EDITOR, "emacs");
+        el_set(edit_, EL_SIGNAL, 0);
+        el_set(edit_, EL_SETTY, "-d", "-isig", "-echoctl", nullptr);
+        el_set(edit_, EL_PROMPT_ESC, &Terminal::prompt_callback, '\1');
+        el_set(edit_, EL_HIST, history, history_);
+        el_set(edit_, EL_ADDFN, "crepl-cancel", "clear current input",
+               &Terminal::cancel_callback);
+        el_set(edit_, EL_ADDFN, "crepl-complete", "complete C++ name",
+               &Terminal::complete_callback);
+        el_set(edit_, EL_BIND, "^C", "crepl-cancel", nullptr);
+        el_set(edit_, EL_BIND, "^I", "crepl-complete", nullptr);
+        el_set(edit_, EL_BIND, "^P", "ed-prev-history", nullptr);
+        el_set(edit_, EL_BIND, "^N", "ed-next-history", nullptr);
+        el_set(edit_, EL_BIND, "^R", "em-inc-search-prev", nullptr);
+        el_set(edit_, EL_BIND, "^L", "ed-clear-screen", nullptr);
+    }
+
+    void reset_editline()
+    {
+        el_end(edit_);
+        use_editing_termios();
+        edit_ = el_init("crepl", stdin, stdout, stderr);
+        restore_normal_termios();
+        if (!edit_)
+            throw std::runtime_error("could not reset libedit");
+        configure_editline();
+    }
+
     static Terminal* self(EditLine* edit)
     {
         Terminal* terminal = nullptr;
@@ -222,17 +283,9 @@ private:
                 : ". ";
         }
         else {
-            std::ostringstream prompt;
-            if (terminal->colors_enabled()) {
-                prompt << "\1\033[1;92m\1crepl \1\033[1;96m\1["
-                       << terminal->execution_
-                       << "]\1\033[0m\1\n"
-                       << "\1\033[1;92m\1> \1\033[0;92m\1";
-            }
-            else {
-                prompt << "crepl [" << terminal->execution_ << "]\n> ";
-            }
-            terminal->prompt_ = prompt.str();
+            terminal->prompt_ = terminal->colors_enabled()
+                ? "\1\033[1;92m\1> \1\033[0;92m\1"
+                : "> ";
         }
         return terminal->prompt_.data();
     }
@@ -240,23 +293,13 @@ private:
     static unsigned char cancel_callback(EditLine* edit, int)
     {
         Terminal* terminal = self(edit);
-        el_replacestr(edit, "");
+        // libedit rejects an empty replacement.  Replace with one temporary
+        // byte, then delete it at the cursor to obtain a genuinely empty line.
+        el_replacestr(edit, " ");
+        el_deletestr(edit, 1);
 
-        if (terminal->cancel_handler_)
-            terminal->cancel_handler_();
-
-        // Move back over the header and every already accepted continuation
-        // line, clear that editing region, then let libedit redraw the same
-        // execution prompt.  No newline or ^C is emitted.
-        const unsigned lines_up = terminal->completed_input_lines_ + 1;
-        std::fputs("\r\033[2K", stdout);
-        if (lines_up != 0)
-            std::fprintf(stdout, "\033[%uA\r", lines_up);
-        std::fputs("\033[J", stdout);
-        std::fflush(stdout);
-
-        terminal->continuation_ = false;
-        terminal->completed_input_lines_ = 0;
+        terminal->clear_editing_region();
+        terminal->print_header();
         return CC_REDISPLAY;
     }
 
@@ -320,6 +363,63 @@ private:
                     history_path_.c_str());
     }
 
+    void use_editing_termios()
+    {
+#if !defined(_WIN32)
+        if (have_termios_)
+            tcsetattr(STDIN_FILENO, TCSANOW, &editing_termios_);
+#endif
+    }
+
+    void restore_normal_termios()
+    {
+#if !defined(_WIN32)
+        if (have_termios_)
+            tcsetattr(STDIN_FILENO, TCSANOW, &normal_termios_);
+#endif
+    }
+
+    void clear_editing_region()
+    {
+        if (cancel_handler_)
+            cancel_handler_();
+
+        const unsigned lines_up = completed_input_lines_ + 1;
+        if (interactive_) {
+            std::fputs("\r\033[2K", stdout);
+            if (lines_up != 0)
+                std::fprintf(stdout, "\033[%uA\r", lines_up);
+            std::fputs("\033[J", stdout);
+            std::fflush(stdout);
+        }
+        continuation_ = false;
+        completed_input_lines_ = 0;
+    }
+
+#if !defined(_WIN32)
+    static void interrupt_handler(int)
+    {
+        interrupted_ = 1;
+    }
+#endif
+
+    void print_header()
+    {
+        if (!interactive_)
+            return;
+        if (colors_enabled()) {
+            std::fprintf(
+                stdout,
+                "\033[1;92mcrepl \033[1;96m[%u]\033[0m\n",
+                execution_
+            );
+        }
+        else {
+            std::fprintf(stdout, "crepl [%u]\n", execution_);
+        }
+        std::fflush(stdout);
+    }
+
     bool colors_enabled() const
     {
         return color_output;
@@ -332,9 +432,16 @@ private:
     unsigned execution_ = 1;
     unsigned completed_input_lines_ = 0;
     bool continuation_ = false;
+    bool interactive_ = false;
     std::string prompt_;
     std::function<void()> cancel_handler_;
     Completer completer_;
+#if !defined(_WIN32)
+    static inline volatile std::sig_atomic_t interrupted_ = 0;
+    struct termios normal_termios_{};
+    struct termios editing_termios_{};
+    bool have_termios_ = false;
+#endif
 };
 
 
@@ -1961,6 +2068,75 @@ struct ExecutionRecord {
 };
 
 
+static CompletionResult complete_qualified_name(
+    clang::ASTContext& ast,
+    llvm::StringRef line,
+    unsigned column
+)
+{
+    CompletionResult result;
+    line = line.take_front(std::min<std::size_t>(column, line.size()));
+    std::size_t begin = line.size();
+    while (begin > 0) {
+        const char ch = line[begin - 1];
+        if (!(std::isalnum(static_cast<unsigned char>(ch)) ||
+              ch == '_' || ch == ':')) {
+            break;
+        }
+        --begin;
+    }
+
+    llvm::StringRef token = line.drop_front(begin);
+    const std::size_t separator = token.rfind("::");
+    if (separator == llvm::StringRef::npos)
+        return result;
+
+    llvm::StringRef qualifier = token.take_front(separator);
+    result.prefix = token.drop_front(separator + 2).str();
+    const clang::DeclContext* context = ast.getTranslationUnitDecl();
+
+    while (!qualifier.empty()) {
+        const auto split = qualifier.split("::");
+        const llvm::StringRef component = split.first;
+        qualifier = split.second;
+        const clang::NamespaceDecl* found = nullptr;
+        for (const clang::Decl* declaration : context->decls()) {
+            const auto* namespace_decl =
+                llvm::dyn_cast<clang::NamespaceDecl>(declaration);
+            if (namespace_decl && namespace_decl->getName() == component) {
+                found = namespace_decl;
+                break;
+            }
+        }
+        if (!found)
+            return {};
+        context = found;
+    }
+
+    std::set<std::string> names;
+    const auto collect = [&](const clang::DeclContext* declaration_context) {
+        for (const clang::Decl* declaration : declaration_context->decls()) {
+            const auto* named = llvm::dyn_cast<clang::NamedDecl>(declaration);
+            if (!named || !named->getDeclName().isIdentifier())
+                continue;
+            const llvm::StringRef name = named->getName();
+            if (name.starts_with(result.prefix))
+                names.insert(name.str());
+        }
+    };
+    collect(context);
+    if (const auto* namespace_context =
+            llvm::dyn_cast<clang::NamespaceDecl>(context)) {
+        for (const clang::NamespaceDecl* redeclaration :
+             namespace_context->redecls()) {
+            collect(redeclaration);
+        }
+    }
+    result.candidates.assign(names.begin(), names.end());
+    return result;
+}
+
+
 static const ExecutionRecord* find_execution(
     const std::vector<ExecutionRecord>& executions,
     unsigned number
@@ -2036,6 +2212,7 @@ static bool needs_more_input(
         Normal,
         String,
         Character,
+        RawString,
         LineComment,
         BlockComment
     };
@@ -2045,6 +2222,7 @@ static bool needs_more_input(
     int parentheses = 0;
     int brackets = 0;
     int braces = 0;
+    std::string raw_terminator;
 
     for (std::size_t index = 0; index < code.size(); ++index) {
         const char ch = code[index];
@@ -2062,6 +2240,14 @@ static bool needs_more_input(
             if (ch == '*' && next == '/') {
                 state = LexState::Normal;
                 ++index;
+            }
+            continue;
+        }
+
+        if (state == LexState::RawString) {
+            if (code.substr(index).starts_with(raw_terminator)) {
+                index += raw_terminator.size() - 1;
+                state = LexState::Normal;
             }
             continue;
         }
@@ -2084,7 +2270,25 @@ static bool needs_more_input(
             continue;
         }
 
-        if (ch == '/' && next == '/') {
+        if (ch == 'R' && next == '"') {
+            const std::size_t delimiter_begin = index + 2;
+            const std::size_t opening = code.find('(', delimiter_begin);
+            if (opening == llvm::StringRef::npos ||
+                opening - delimiter_begin > 16) {
+                state = LexState::RawString;
+                raw_terminator = "\x00";
+            }
+            else {
+                raw_terminator = ")";
+                raw_terminator += code
+                    .slice(delimiter_begin, opening)
+                    .str();
+                raw_terminator += '"';
+                index = opening;
+                state = LexState::RawString;
+            }
+        }
+        else if (ch == '/' && next == '/') {
             state = LexState::LineComment;
             ++index;
         }
@@ -2121,6 +2325,7 @@ static bool needs_more_input(
     return parentheses > 0 || brackets > 0 || braces > 0 ||
         state == LexState::String ||
         state == LexState::Character ||
+        state == LexState::RawString ||
         state == LexState::BlockComment;
 }
 
@@ -3233,6 +3438,12 @@ static llvm::Expected<std::unique_ptr<clang::Interpreter>> create_session(
 }
 
 
+static int run_frontend(
+    clang::IncrementalCompilerBuilder& builder,
+    std::unique_ptr<clang::Interpreter> interpreter
+);
+
+
 // ============================================================
 // main
 // ============================================================
@@ -3308,6 +3519,16 @@ int main()
     std::unique_ptr<clang::Interpreter> interpreter =
         std::move(*interpreter_or_error);
 
+    return run_frontend(builder, std::move(interpreter));
+}
+
+
+static int run_frontend(
+    clang::IncrementalCompilerBuilder& builder,
+    std::unique_ptr<clang::Interpreter> interpreter
+)
+{
+
 
     // --------------------------------------------------------
     // REPL
@@ -3329,13 +3550,10 @@ int main()
     });
     terminal.set_completer(
         [&](llvm::StringRef current_line,
-            unsigned line_number,
+            unsigned,
             unsigned column) -> CompletionResult {
             CompletionResult completion;
-            std::string content = input;
-            if (!content.empty())
-                content += '\n';
-            content += current_line.str();
+            const std::string content = current_line.str();
 
             auto compiler = builder.CreateCpp();
             if (!compiler) {
@@ -3352,12 +3570,16 @@ int main()
             completer.codeComplete(
                 (*child)->getCompilerInstance(),
                 content,
-                line_number,
+                1,
                 column + 1,
                 interpreter->getCompilerInstance(),
                 completion.candidates
             );
             completion.prefix = std::move(completer.Prefix);
+            if (completion.candidates.empty())
+                completion = complete_qualified_name(
+                    interpreter->getASTContext(), current_line, column
+                );
             return completion;
         }
     );
@@ -3369,8 +3591,8 @@ int main()
         if (!line)
             break;
 
-        llvm::StringRef current =
-            llvm::StringRef(*line).trim();
+        const llvm::StringRef raw_line(*line);
+        llvm::StringRef current = raw_line.trim();
 
 
         // 空行
@@ -3407,7 +3629,7 @@ int main()
         }
 
 
-        append_input_line(input, current, !join_next_line);
+        append_input_line(input, raw_line, !join_next_line);
         join_next_line = false;
 
         if (needs_more_input(input)) {
@@ -3419,6 +3641,8 @@ int main()
             );
             continue;
         }
+
+        input = llvm::StringRef(input).trim().str();
 
 
         // ----------------------------------------------------
