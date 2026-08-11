@@ -8,46 +8,67 @@ Clang REPL 对普通声明、表达式和对象的执行能力，并为裸整数
 ## 依赖
 
 当前实现已在 Fedora Linux、Clang/LLVM 22.1.8、GCC/libstdc++ 16 上验证。
-需要安装：
+构建需要 CMake 3.20+、Ninja、Clang/LLVM 22，以及包含
+`LLVMConfig.cmake`、`ClangConfig.cmake`、Clang Interpreter 头文件和库的
+LLVM/Clang 开发包。Fedora 可安装：
 
 ```bash
-sudo dnf install clang-devel llvm-devel gcc-c++
+sudo dnf install clang-devel llvm-devel gcc-c++ cmake ninja-build
 ```
 
-运行时需要能在 `PATH` 中找到与链接的 `libclang-cpp` 相匹配的 `clang++`。
-程序会从该可执行文件推导 Clang 的 resource directory，以便解释器能找到
-`stddef.h` 等 Clang builtin headers。
+CMake 会把所链接 LLVM 安装中的 `clang++` 路径编入程序。程序从该可执行文件
+推导 Clang 的 resource directory，以便解释器能找到 `stddef.h` 等 builtin
+headers，并避免系统中存在多个 LLVM 版本时误用不匹配的驱动。
 
 ## 编译
 
-在项目目录执行：
+仓库提供了 Clang + Ninja preset。在项目目录执行：
 
 ```bash
-clang++ \
-    crepl.cpp \
-    -o crepl \
-    $(llvm-config --cxxflags) \
-    -std=c++17 \
-    $(llvm-config --ldflags) \
-    -lclang-cpp \
-    -lLLVM \
-    $(llvm-config --system-libs)
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev
 ```
 
 然后运行：
 
 ```bash
-./crepl
+./build/bin/crepl
 ```
 
-运行黑盒回归测试（脚本会先使用上面的命令重新编译）：
+也可以在已构建后直接运行黑盒回归测试：
 
 ```bash
 tests/regression.sh
 ```
 
-解释器内使用 C++20（`crepl.cpp` 传给 `IncrementalCompilerBuilder` 的选项），
-而宿主程序本身以 C++17 编译。
+宿主程序和解释器内执行的代码现在都使用 C++20。CMake 会优先链接发行版提供的
+`clang-cpp`/`LLVM` 共享目标；若发行版只提供拆分库，则回退到所需组件。
+
+如果 CMake 没有自动找到 LLVM，可显式指定配置目录：
+
+```bash
+cmake --preset dev \
+    -DLLVM_DIR="$(llvm-config --cmakedir)" \
+    -DClang_DIR="$(llvm-config --cmakedir | sed 's#/llvm$#/clang#')"
+```
+
+## 平台与 CI
+
+GitHub Actions 使用原生 `ubuntu-24.04` x86_64 和 `ubuntu-24.04-arm` arm64
+runner，从 LLVM 官方 APT 仓库安装 LLVM 22，以 Clang、CMake 和 Ninja 完成
+构建、回归测试并保存可执行文件。Ubuntu 24.04 自带的 LLVM 18 缺少本项目所用
+的较新 Clang Interpreter API，不能用于该 CI 构建。
+
+Windows 代码路径已使用 `VirtualQuery` 与 `ReadProcessMemory` 实现内存范围检查
+和安全复制，移除了源代码对 `/proc/self/maps`、`process_vm_readv()` 的硬依赖。
+不过 `crepl` 嵌入实验性的 Clang Interpreter，链接时需要完整 LLVM/Clang
+开发 SDK。首次 CI 探测显示，Windows x86_64 runner 没有可用的完整 SDK；
+Windows arm64 预览 runner 虽然带有 CMake package 和链接库，当前仍缺少 LLVM
+目标引用的 ARM64 `diaguids.lib`，构建会在链接前停止。因此 Windows 还不能
+作为可复现的发布目标。workflow 会在两个 Windows 架构上持续探测，SDK 完整
+时自动尝试配置和构建，并把结论写入 job summary。Windows 支持目前应视为
+实验性且未验证。
 
 ## 彩色输出
 
@@ -70,7 +91,7 @@ tests/regression.sh
 遵循通用的 `NO_COLOR` 约定，可以显式禁用交互颜色：
 
 ```bash
-NO_COLOR=1 ./crepl
+NO_COLOR=1 ./build/bin/crepl
 ```
 
 ## 使用
@@ -231,8 +252,8 @@ crepl> p
      hex  :    0    0    0    0    0    0    0    d
 ```
 
-解引用前先检查 `/proc/self/maps`，再通过 `process_vm_readv()` 把目标字节复制
-到本地 buffer，渲染层不会直接访问目标地址。对象指针只显示目标类型和地址，
+解引用前先检查当前平台的内存映射，再把目标字节安全复制到本地 buffer，
+渲染层不会直接访问目标地址。对象指针只显示目标类型和地址，
 不会猜测业务对象内部关系；链表等 record 级可视化仍属于后续扩展。
 
 ## 监视变量
@@ -353,8 +374,9 @@ crepl> %mem p 32
 而 `%mem p 32` 查看 `p` 指向地址开始的 32 字节。单次长度限制为
 1–65536 字节；该限制同时应用于显式长度和默认 `sizeof(object)` 路径。
 
-读取前程序会检查 Linux `/proc/self/maps`，拒绝 null、地址溢出、未映射或
-不可读的范围，然后用 `process_vm_readv()` 一次复制到本地 buffer 后再渲染。
+读取前程序会检查内存映射，拒绝 null、地址溢出、未映射或不可读的范围；
+Linux 使用 `/proc/self/maps` 与 `process_vm_readv()`，Windows 使用
+`VirtualQuery` 与 `ReadProcessMemory`，之后统一复制到本地 buffer 再渲染。
 这会降低常见非法地址、映射竞争和渲染期间地址变化导致崩溃的概率，但仍是
 best-effort 保护，不是 debugger 的一致性快照：其他线程仍可能并发修改内容，
 读取也可能因为映射或后备文件状态变化而失败。内存查看应只用于当前进程中
@@ -426,9 +448,11 @@ union 和 bit-field 也可检查。为避免把基类子对象或 vptr 错报成
   specialization 接口。
 
 变量监视、快照和辅助捕获依赖 `Interpreter::Undo()` 清理内部求值产生的增量
-编译单元；`%type` 则用同一机制清理 unevaluated type alias。内存范围检查
-使用 `/proc/self/maps`，安全复制使用 Linux `process_vm_readv()`，因此 `%mem`
-当前明确面向 Linux。
+编译单元；`%type` 则用同一机制清理 unevaluated type alias。Linux 内存范围
+检查使用 `/proc/self/maps`，安全复制使用
+`process_vm_readv()`；Windows 对应路径使用 `VirtualQuery` 与
+`ReadProcessMemory`。Windows 的完整程序构建仍取决于可链接的 Clang
+Interpreter 开发 SDK。
 
 `std::vector` pretty printer 通过 Clang AST 查找当前 libstdc++ 实例化中的
 `_M_start` 和 `_M_finish`，不硬编码字节 offset，但仍依赖这些字段名和布局

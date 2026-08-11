@@ -3,7 +3,7 @@
 set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-binary="$project_dir/crepl"
+binary=${CREPL_BINARY:-"$project_dir/build/bin/crepl"}
 
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
@@ -23,15 +23,9 @@ contains() {
 }
 
 cd "$project_dir"
-clang++ \
-    crepl.cpp \
-    -o crepl \
-    $(llvm-config --cxxflags) \
-    -std=c++17 \
-    $(llvm-config --ldflags) \
-    -lclang-cpp \
-    -lLLVM \
-    $(llvm-config --system-libs)
+
+[[ -x $binary ]] ||
+    fail "crepl executable not found at $binary; run cmake --build --preset dev first"
 
 layout_output=$(run_crepl $'struct B { int x; };\nstruct D : B { int y; };\n%layout D\nstruct V { virtual void f(); int x; };\n%layout V\n%quit\n')
 layout_rejections=$(grep -Fc 'inheritance/vptr layout is not supported yet' <<<"$layout_output")

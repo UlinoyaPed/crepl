@@ -40,8 +40,13 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/uio.h>
 #include <unistd.h>
+#endif
 
 
 // ============================================================
@@ -2518,6 +2523,42 @@ static bool is_readable_memory(
     }
 
     const std::uintptr_t requested_end = address + size;
+
+#if defined(_WIN32)
+    std::uintptr_t cursor = address;
+
+    while (cursor < requested_end) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(
+                reinterpret_cast<const void*>(cursor),
+                &region,
+                sizeof(region)
+            ) == 0) {
+            return false;
+        }
+
+        const DWORD inaccessible =
+            PAGE_NOACCESS | PAGE_GUARD;
+        if (region.State != MEM_COMMIT ||
+            (region.Protect & inaccessible) != 0) {
+            return false;
+        }
+
+        const std::uintptr_t region_begin =
+            reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+        if (region.RegionSize > UINTPTR_MAX - region_begin)
+            return false;
+
+        const std::uintptr_t region_end =
+            region_begin + region.RegionSize;
+        if (region_end <= cursor)
+            return false;
+
+        cursor = region_end;
+    }
+
+    return true;
+#else
     std::ifstream maps("/proc/self/maps");
     std::string line;
 
@@ -2543,6 +2584,7 @@ static bool is_readable_memory(
     }
 
     return false;
+#endif
 }
 
 
@@ -2558,6 +2600,18 @@ static bool read_memory(
     if (!destination || !is_readable_memory(address, size))
         return false;
 
+#if defined(_WIN32)
+    SIZE_T copied = 0;
+    const BOOL succeeded = ReadProcessMemory(
+        GetCurrentProcess(),
+        reinterpret_cast<const void*>(address),
+        destination,
+        size,
+        &copied
+    );
+
+    return succeeded != FALSE && copied == size;
+#else
     iovec local{
         destination,
         size
@@ -2576,6 +2630,7 @@ static bool read_memory(
     );
 
     return copied >= 0 && static_cast<std::size_t>(copied) == size;
+#endif
 }
 
 
@@ -2880,12 +2935,14 @@ int main()
     // IncrementalCompilerBuilder does not infer Clang's builtin-header
     // directory for an arbitrary embedding executable.  Locate the matching
     // clang++ driver and derive its resource directory (for stddef.h, etc.).
+#if defined(CREPL_CLANG_BINARY)
+    std::string clang_binary = CREPL_CLANG_BINARY;
+#else
     std::string clang_binary = "clang++";
 
-    if (auto path =
-            llvm::sys::findProgramByName("clang++")) {
+    if (auto path = llvm::sys::findProgramByName(clang_binary))
         clang_binary = *path;
-    }
+#endif
 
     std::vector<std::string> clang_arg_storage = {
         "-std=c++20",
