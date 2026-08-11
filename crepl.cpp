@@ -1953,6 +1953,50 @@ struct Snapshot {
 };
 
 
+struct ExecutionRecord {
+    unsigned number;
+    std::string input;
+    bool succeeded;
+    std::unique_ptr<clang::Value> value;
+};
+
+
+static const ExecutionRecord* find_execution(
+    const std::vector<ExecutionRecord>& executions,
+    unsigned number
+)
+{
+    const auto found = std::find_if(
+        executions.begin(),
+        executions.end(),
+        [number](const ExecutionRecord& record) {
+            return record.number == number;
+        }
+    );
+    return found == executions.end() ? nullptr : &*found;
+}
+
+
+static std::string format_duration(
+    std::chrono::steady_clock::duration duration
+)
+{
+    const double nanoseconds =
+        std::chrono::duration<double, std::nano>(duration).count();
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(3);
+    if (nanoseconds < 1000.0)
+        output << nanoseconds << " ns";
+    else if (nanoseconds < 1000000.0)
+        output << nanoseconds / 1000.0 << " us";
+    else if (nanoseconds < 1000000000.0)
+        output << nanoseconds / 1000000.0 << " ms";
+    else
+        output << nanoseconds / 1000000000.0 << " s";
+    return output.str();
+}
+
+
 static bool is_identifier(
     llvm::StringRef name
 )
@@ -3126,6 +3170,69 @@ static void print_error(
 }
 
 
+static std::filesystem::path startup_path()
+{
+    if (const char* config_home = std::getenv("XDG_CONFIG_HOME"))
+        return std::filesystem::path(config_home) / "crepl/init.hpp";
+    if (const char* home = std::getenv("HOME"))
+        return std::filesystem::path(home) / ".config/crepl/init.hpp";
+    return {};
+}
+
+
+static void execute_user_startup(clang::Interpreter& interpreter)
+{
+    const std::filesystem::path path = startup_path();
+    std::error_code error;
+    if (path.empty() || !std::filesystem::exists(path, error))
+        return;
+
+    std::ifstream file(path);
+    if (!file) {
+        llvm::errs() << "error: could not read startup file "
+                     << path.string() << "\n";
+        return;
+    }
+
+    std::ostringstream contents;
+    contents << file.rdbuf();
+    if (auto startup_error = interpreter.ParseAndExecute(contents.str())) {
+        llvm::errs() << "crepl: startup file failed: " << path.string()
+                     << "\n";
+        print_error(std::move(startup_error));
+    }
+}
+
+
+static llvm::Expected<std::unique_ptr<clang::Interpreter>> create_session(
+    clang::IncrementalCompilerBuilder& builder
+)
+{
+    auto compiler = builder.CreateCpp();
+    if (!compiler)
+        return compiler.takeError();
+
+    auto created = clang::Interpreter::create(std::move(*compiler));
+    if (!created)
+        return created.takeError();
+
+    std::unique_ptr<clang::Interpreter> interpreter = std::move(*created);
+    if (auto error = interpreter->ParseAndExecute(
+            "#include <iostream>\n"
+            "#include <array>\n"
+            "#include <bitset>\n"
+            "#include <vector>\n"
+            "#include <string>\n"
+            "#include <algorithm>\n"
+            "#include <cstdint>\n")) {
+        return std::move(error);
+    }
+
+    execute_user_startup(*interpreter);
+    return interpreter;
+}
+
+
 // ============================================================
 // main
 // ============================================================
@@ -3193,67 +3300,13 @@ int main()
     builder.SetCompilerArgs(clang_args);
 
 
-    // --------------------------------------------------------
-    // CompilerInstance
-    // --------------------------------------------------------
-
-    auto compiler_or_error =
-        builder.CreateCpp();
-
-    if (!compiler_or_error) {
-        print_error(
-            compiler_or_error.takeError()
-        );
-
-        return 1;
-    }
-
-
-    // --------------------------------------------------------
-    // Interpreter
-    // --------------------------------------------------------
-
-    auto interpreter_or_error =
-        clang::Interpreter::create(
-            std::move(*compiler_or_error)
-        );
-
+    auto interpreter_or_error = create_session(builder);
     if (!interpreter_or_error) {
-        print_error(
-            interpreter_or_error.takeError()
-        );
-
+        print_error(interpreter_or_error.takeError());
         return 1;
     }
-
     std::unique_ptr<clang::Interpreter> interpreter =
         std::move(*interpreter_or_error);
-
-
-    // --------------------------------------------------------
-    // 自动 include
-    //
-    // 所以进入 REPL 后不用再：
-    //
-    //     #include <iostream>
-    //     #include <bitset>
-    // --------------------------------------------------------
-
-    if (
-        auto error =
-            interpreter->ParseAndExecute(
-                "#include <iostream>\n"
-                "#include <array>\n"
-                "#include <bitset>\n"
-                "#include <vector>\n"
-                "#include <string>\n"
-                "#include <algorithm>\n"
-                "#include <cstdint>\n"
-            )
-    ) {
-        print_error(std::move(error));
-        return 1;
-    }
 
 
     // --------------------------------------------------------
@@ -3266,6 +3319,8 @@ int main()
     bool join_next_line = false;
     std::vector<Watch> watches;
     std::vector<std::string> history;
+    std::vector<ExecutionRecord> executions;
+    unsigned next_execution = 1;
     std::map<std::string, Snapshot> snapshots;
 
     terminal.set_cancel_handler([&] {
@@ -3308,10 +3363,12 @@ int main()
     );
 
 
-    while (
-        std::optional<std::string> line =
-            terminal.read_line()
-    ) {
+    while (true) {
+        terminal.set_execution(next_execution);
+        std::optional<std::string> line = terminal.read_line();
+        if (!line)
+            break;
+
         llvm::StringRef current =
             llvm::StringRef(*line).trim();
 
@@ -3373,6 +3430,107 @@ int main()
         }
 
 
+        if (input == "$_" ||
+            (llvm::StringRef(input).starts_with("$") &&
+             input.size() > 1)) {
+            const ExecutionRecord* record = nullptr;
+            if (input == "$_") {
+                const auto found = std::find_if(
+                    executions.rbegin(), executions.rend(),
+                    [](const ExecutionRecord& candidate) {
+                        return candidate.value != nullptr;
+                    }
+                );
+                if (found != executions.rend())
+                    record = &*found;
+                else
+                    llvm::errs() << "crepl: no execution has produced a value\n";
+            }
+            else {
+                std::uint64_t requested = 0;
+                const llvm::StringRef number =
+                    llvm::StringRef(input).drop_front();
+                if (number.getAsInteger(10, requested) ||
+                    requested > std::numeric_limits<unsigned>::max()) {
+                    llvm::errs() << "crepl: invalid execution reference: "
+                                 << input << "\n";
+                }
+                else {
+                    record = find_execution(
+                        executions, static_cast<unsigned>(requested)
+                    );
+                    if (!record)
+                        llvm::errs() << "crepl: execution " << requested
+                                     << " does not exist\n";
+                }
+            }
+
+            if (record) {
+                if (record->value)
+                    print_value(llvm::outs(), *record->value);
+                else
+                    llvm::errs() << "crepl: execution " << record->number
+                                 << " produced no value\n";
+            }
+
+            input.clear();
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
+            continue;
+        }
+
+        bool timed_execution = false;
+        std::string submitted_input = input;
+
+        if (input == "%rerun" || input == "%r" ||
+            llvm::StringRef(input).starts_with("%rerun ") ||
+            llvm::StringRef(input).starts_with("%r ")) {
+            const llvm::StringRef argument = llvm::StringRef(input)
+                .drop_front(input.starts_with("%rerun") ? 6 : 2)
+                .trim();
+            std::uint64_t requested = 0;
+            const ExecutionRecord* record = nullptr;
+            if (argument.empty() || argument.getAsInteger(10, requested) ||
+                requested > std::numeric_limits<unsigned>::max()) {
+                llvm::errs() << "error: usage: %rerun <execution>\n";
+            }
+            else {
+                record = find_execution(
+                    executions, static_cast<unsigned>(requested)
+                );
+                if (!record)
+                    llvm::errs() << "crepl: execution " << requested
+                                 << " does not exist\n";
+            }
+
+            if (!record) {
+                input.clear();
+                terminal.set_continuation(false);
+                terminal.set_completed_input_lines(0);
+                continue;
+            }
+            input = record->input;
+            submitted_input = input;
+        }
+
+        if (input == "%time" ||
+            llvm::StringRef(input).starts_with("%time ")) {
+            const llvm::StringRef expression = input == "%time"
+                ? llvm::StringRef()
+                : llvm::StringRef(input).drop_front(6).trim();
+            if (expression.empty()) {
+                llvm::errs() << "error: usage: %time <expression>\n";
+                input.clear();
+                terminal.set_continuation(false);
+                terminal.set_completed_input_lines(0);
+                continue;
+            }
+            input = expression.str();
+            submitted_input = "%time " + input;
+            timed_execution = true;
+        }
+
+
         if (input == "%help") {
             print_help_line("%help", "show commands");
             print_help_line("%watch [name...]", "watch variables");
@@ -3387,15 +3545,56 @@ int main()
             print_help_line("%layout <type>", "show record layout");
             print_help_line("%state", "show watched values");
             print_help_line("%snapshot <name>", "save watched state");
-            print_help_line("%history [count]", "show successful inputs");
+            print_help_line("%history [count]", "show submitted executions");
+            print_help_line("%rerun <n> / %r <n>", "rerun an execution");
+            print_help_line("%time <expr>", "time compilation and execution");
+            print_help_line("%reset", "reset the interpreter session");
+            print_help_line("%reload", "reset and reload init.hpp");
             print_help_line("%undo", "undo previous user input");
             print_help_line("%lib <path>", "load dynamic library");
             print_help_line("%quit", "exit");
+            print_help_line("$_ / $n", "print a saved execution value");
+            print_help_line("Tab", "semantic C++ completion");
+            print_help_line("Ctrl-C", "clear the current editing buffer");
+            print_help_line("Ctrl-R", "search persistent history");
+            print_help_line("Ctrl-L", "clear the terminal");
+            print_help_line("Up/Down, Ctrl-P/N", "navigate history");
 
             input.clear();
             terminal.set_continuation(false);
             terminal.set_completed_input_lines(0);
 
+            continue;
+        }
+
+
+        if (input == "%reset" || input == "%reload") {
+            const bool reload = input == "%reload";
+
+            // Values can own allocations whose destructors are compiled by
+            // this Interpreter.  Destroy them before destroying the session.
+            executions.clear();
+            history.clear();
+            watches.clear();
+            snapshots.clear();
+            interpreter.reset();
+
+            auto fresh = create_session(builder);
+            if (!fresh) {
+                print_error(fresh.takeError());
+                return 1;
+            }
+            interpreter = std::move(*fresh);
+            next_execution = 1;
+
+            print_label(
+                llvm::outs(),
+                reload ? "startup reloaded; session reset\n"
+                       : "session reset\n"
+            );
+            input.clear();
+            terminal.set_continuation(false);
+            terminal.set_completed_input_lines(0);
             continue;
         }
 
@@ -3460,7 +3659,7 @@ int main()
             const llvm::StringRef count_text = input == "%history"
                 ? llvm::StringRef()
                 : llvm::StringRef(input).drop_front(9).trim();
-            std::uint64_t requested = history.size();
+            std::uint64_t requested = executions.size();
             bool valid = true;
 
             if (!count_text.empty() &&
@@ -3472,16 +3671,15 @@ int main()
 
             if (valid) {
                 const std::size_t count = static_cast<std::size_t>(
-                    std::min<std::uint64_t>(requested, history.size())
+                    std::min<std::uint64_t>(requested, executions.size())
                 );
-                const std::size_t begin = history.size() - count;
+                const std::size_t begin = executions.size() - count;
 
-                for (std::size_t index = begin; index < history.size();
+                for (std::size_t index = begin; index < executions.size();
                      ++index) {
                     llvm::outs()
-                        << index + 1
-                        << "  "
-                        << history[index]
+                        << "[" << executions[index].number << "] "
+                        << executions[index].input
                         << "\n";
                 }
             }
@@ -3988,6 +4186,8 @@ int main()
 
         clang::Value value;
         bool execution_succeeded = false;
+        const unsigned execution_number = next_execution++;
+        const auto execution_started = std::chrono::steady_clock::now();
 
         if (
             auto error =
@@ -4014,6 +4214,25 @@ int main()
                 print_value(llvm::outs(), value);
 
             refresh_watches(*interpreter, watches);
+        }
+
+        const auto execution_finished = std::chrono::steady_clock::now();
+        std::unique_ptr<clang::Value> saved_value;
+        if (execution_succeeded && value.hasValue())
+            saved_value = std::make_unique<clang::Value>(value);
+        executions.push_back(ExecutionRecord{
+            execution_number,
+            submitted_input,
+            execution_succeeded,
+            std::move(saved_value)
+        });
+        terminal.add_history(submitted_input);
+
+        if (timed_execution) {
+            print_label(llvm::outs(), "time : ");
+            llvm::outs() << format_duration(
+                execution_finished - execution_started
+            ) << "\n";
         }
 
 
